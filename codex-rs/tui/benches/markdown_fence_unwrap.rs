@@ -1,8 +1,8 @@
 //! Allocation counter for the unchanged-fence path in the streaming markdown normalizer.
 //!
-//! The normalizer's output is consumed and checked against the source on each operation.  The
-//! counter is enabled only around the normalizer, so fixture construction and validation do not
-//! contribute to the reported allocation metrics.
+//! The normalizer's output is consumed and checked against the source on each operation. A timed
+//! pass runs with allocation counting disabled; a second pass enables the counter only around the
+//! normalizer, so fixture construction and validation do not contribute to allocation metrics.
 
 use codex_tui::benchmark_unwrap_markdown_fences;
 use std::alloc::GlobalAlloc;
@@ -13,6 +13,7 @@ use std::env;
 use std::hint::black_box;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 const ITERATIONS: u64 = 512;
 const TARGET_SOURCE_BYTES: usize = 64 * 1024;
@@ -111,30 +112,44 @@ fn run_unfinished_rust_fence() {
     // Distinct runtime-owned inputs prevent compile-time folding while keeping every operation on
     // the same large, unchanged non-markdown fence path.
     let inputs = [unfinished_rust_fence(b'a'), unfinished_rust_fence(b'b')];
-    let mut total = AllocationCounts::default();
+    let mut total_allocations = AllocationCounts::default();
+    let mut total_nanoseconds = 0u128;
 
     for iteration in 0..ITERATIONS {
         let source = black_box(inputs[(iteration as usize) % inputs.len()].as_str());
 
-        begin_measurement();
-        let normalized = benchmark_unwrap_markdown_fences(source);
-        let output = black_box(normalized.as_ref());
-        total += end_measurement();
-
+        let started = Instant::now();
+        let timed_normalized = benchmark_unwrap_markdown_fences(source);
+        total_nanoseconds += started.elapsed().as_nanos();
+        let timed_output = black_box(timed_normalized.as_ref());
         assert_eq!(
-            output, source,
+            timed_output, source,
             "an unchanged non-markdown fence must retain its source bytes"
         );
-        black_box(output.len());
+        black_box(timed_output.len());
+
+        begin_measurement();
+        let counted_normalized = benchmark_unwrap_markdown_fences(source);
+        let counted_output = black_box(counted_normalized.as_ref());
+        total_allocations += end_measurement();
+        assert_eq!(
+            counted_output, source,
+            "an unchanged non-markdown fence must retain its source bytes"
+        );
+        black_box(counted_output.len());
     }
 
     println!(
+        r#"{{"metric":"ns/op","value":{}}}"#,
+        total_nanoseconds / u128::from(ITERATIONS)
+    );
+    println!(
         r#"{{"metric":"allocated_bytes/op","value":{}}}"#,
-        total.bytes / ITERATIONS
+        total_allocations.bytes / ITERATIONS
     );
     println!(
         r#"{{"metric":"allocations/op","value":{}}}"#,
-        total.calls / ITERATIONS
+        total_allocations.calls / ITERATIONS
     );
 }
 
