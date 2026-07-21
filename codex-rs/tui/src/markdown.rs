@@ -560,6 +560,13 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_markdown_fences_keeps_unfinished_markdown_table_fence() {
+        let src = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let normalized = unwrap_markdown_fences(src);
+        assert_eq!(normalized, src);
+    }
+
+    #[test]
     fn append_markdown_agent_keeps_markdown_fence_with_blank_line_between_header_and_delimiter() {
         let src = "```markdown\n| A | B |\n\n|---|---|\n| 1 | 2 |\n```\n";
         let rendered = unwrap_markdown_fences(src);
