@@ -353,6 +353,13 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
     Cow::Owned(out)
 }
 
+/// Exposes fence unwrapping only to the benchmark target selected by `perfloop-bench`.
+#[cfg(feature = "perfloop-bench")]
+#[doc(hidden)]
+pub fn benchmark_unwrap_markdown_fences(markdown_source: &str) -> Cow<'_, str> {
+    unwrap_markdown_fences(markdown_source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

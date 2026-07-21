@@ -142,6 +142,8 @@ pub use live_wrap::RowBuilder;
 mod local_chatgpt_auth;
 mod managed_new_thread_defaults;
 mod markdown;
+#[cfg(feature = "perfloop-bench")]
+pub use markdown::benchmark_unwrap_markdown_fences;
 mod markdown_render;
 mod markdown_stream;
 mod markdown_text_merge;

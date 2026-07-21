@@ -21,6 +21,10 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# Exposes benchmark-only instrumentation used by the local fence-unwrapping benchmark.
+perfloop-bench = []
+
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -163,3 +167,8 @@ tokio-tungstenite = { workspace = true }
 vt100 = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
+
+[[bench]]
+name = "markdown_fence_unwrap"
+harness = false
+required-features = ["perfloop-bench"]
