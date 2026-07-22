@@ -1012,6 +1012,34 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_returns_directory_match_for_followed_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("target-directory")).unwrap();
+        fs::write(dir.path().join("target-directory/child.txt"), "child").unwrap();
+        symlink("target-directory", dir.path().join("linked-directory")).unwrap();
+
+        let results = run(
+            "linked-directory",
+            vec![dir.path().to_path_buf()],
+            FileSearchOptions::default(),
+            /*cancel_flag*/ None,
+        )
+        .expect("run ok");
+
+        assert!(results.matches.iter().any(|file_match| {
+            file_match.path == Path::new("linked-directory")
+                && file_match.match_type == MatchType::Directory
+        }));
+        assert!(results.matches.iter().any(|file_match| {
+            file_match.path == Path::new("linked-directory").join("child.txt")
+                && file_match.match_type == MatchType::File
+        }));
+    }
+
     #[test]
     fn cancel_exits_run() {
         let dir = create_temp_tree(/*file_count*/ 200);
