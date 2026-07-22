@@ -361,6 +361,11 @@ enum WorkSignal {
     Shutdown,
 }
 
+struct SearchItem {
+    full_path: Arc<str>,
+    match_type: MatchType,
+}
+
 fn build_override_matcher(
     search_directory: &Path,
     exclude: &[String],
@@ -411,7 +416,7 @@ fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(
 fn walker_worker(
     inner: Arc<SessionInner>,
     override_matcher: Option<ignore::overrides::Override>,
-    injector: Injector<Arc<str>>,
+    injector: Injector<SearchItem>,
 ) {
     let Some(first_root) = inner.search_directories.first() else {
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
@@ -462,10 +467,24 @@ fn walker_worker(
             let Some(full_path) = path.to_str() else {
                 return ignore::WalkState::Continue;
             };
+            let match_type = if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                MatchType::Directory
+            } else {
+                MatchType::File
+            };
             if let Some((_, relative_path)) = get_file_path(path, &search_directories) {
-                injector.push(Arc::from(full_path), |_, cols| {
-                    cols[0] = Utf32String::from(relative_path);
-                });
+                injector.push(
+                    SearchItem {
+                        full_path: Arc::from(full_path),
+                        match_type,
+                    },
+                    |_, cols| {
+                        cols[0] = Utf32String::from(relative_path);
+                    },
+                );
             }
             n += 1;
             if n >= CHECK_INTERVAL {
@@ -483,7 +502,7 @@ fn walker_worker(
 fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
-    mut nucleo: Nucleo<Arc<str>>,
+    mut nucleo: Nucleo<SearchItem>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
     let config = Config::DEFAULT.match_paths();
@@ -547,7 +566,7 @@ fn matcher_worker(
                         .take(limit)
                         .filter_map(|match_| {
                             let item = snapshot.get_item(match_.idx)?;
-                            let full_path = item.data.as_ref();
+                            let full_path = item.data.full_path.as_ref();
                             let (root_idx, relative_path) = get_file_path(Path::new(full_path), &inner.search_directories)?;
                             let indices = if let Some(indices_matcher) = indices_matcher.as_mut() {
                                 let mut idx_vec = Vec::<u32>::new();
@@ -559,15 +578,10 @@ fn matcher_worker(
                             } else {
                                 None
                             };
-                            let match_type = if Path::new(full_path).is_dir() {
-                                MatchType::Directory
-                            } else {
-                                MatchType::File
-                            };
                             Some(FileMatch {
                                 score: match_.score,
                                 path: PathBuf::from(relative_path),
-                                match_type,
+                                match_type: item.data.match_type,
                                 root: inner.search_directories[root_idx].clone(),
                                 indices,
                             })
