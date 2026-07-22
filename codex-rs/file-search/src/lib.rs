@@ -43,7 +43,8 @@ pub use cli::Cli;
 /// * `score` – Relevance score returned by `nucleo`.
 /// * `path`  – Path to the matched entry (file or directory), relative to the
 ///   search directory.
-/// * `match_type` – Whether this match is a file or directory.
+/// * `match_type` – Whether the entry was a file or directory when the
+///   session walked it.
 /// * `indices` – Optional list of character indices that matched the query.
 ///   These are only filled when the caller of [`run`] sets
 ///   `options.compute_indices` to `true`. The indices vector follows the
@@ -134,12 +135,19 @@ pub trait SessionReporter: Send + Sync + 'static {
     fn on_complete(&self);
 }
 
+/// A reusable fuzzy search over entries discovered during its initial walk.
+///
+/// The session does not watch or re-walk its roots. Query updates use the
+/// entries and types captured by the walk, so changes after an entry is walked
+/// are not reflected in later snapshots.
 pub struct FileSearchSession {
     inner: Arc<SessionInner>,
 }
 
 impl FileSearchSession {
-    /// Update the query. This should be cheap relative to re-walking.
+    /// Update the query against entries captured by the initial walk.
+    ///
+    /// This should be cheap relative to re-walking.
     pub fn update_query(&self, pattern_text: &str) {
         let _ = self
             .inner
@@ -880,6 +888,51 @@ mod tests {
                 .matches
                 .iter()
                 .any(|file_match| file_match.path.to_string_lossy().contains("beta.txt"))
+        );
+    }
+
+    #[test]
+    fn session_keeps_match_type_from_initial_walk_after_path_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.txt");
+        fs::write(&alpha, "alpha").unwrap();
+        let reporter = Arc::new(RecordingReporter::default());
+        let session = create_session(
+            vec![dir.path().to_path_buf()],
+            FileSearchOptions::default(),
+            reporter.clone(),
+            /*cancel_flag*/ None,
+        )
+        .expect("session");
+
+        session.update_query("alpha");
+        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+        assert_eq!(
+            reporter
+                .snapshot()
+                .matches
+                .iter()
+                .find(|file_match| file_match.path == Path::new("alpha.txt"))
+                .expect("initial match")
+                .match_type,
+            MatchType::File
+        );
+
+        reporter.clear();
+        fs::remove_file(&alpha).unwrap();
+        fs::create_dir(&alpha).unwrap();
+
+        session.update_query("alpha");
+        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
+        assert_eq!(
+            reporter
+                .snapshot()
+                .matches
+                .iter()
+                .find(|file_match| file_match.path == Path::new("alpha.txt"))
+                .expect("walked match")
+                .match_type,
+            MatchType::File
         );
     }
 
