@@ -29,12 +29,13 @@ impl RecordingReporter {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().unwrap();
         loop {
-            if let Some(snapshot) = state
-                .updates
-                .iter()
-                .rev()
-                .find(|snapshot| snapshot.query == query)
-            {
+            if let Some(snapshot) = state.updates.iter().rev().find(|snapshot| {
+                snapshot.query == query
+                    && snapshot
+                        .matches
+                        .iter()
+                        .any(|file_match| file_match.path.to_string_lossy().contains(query))
+            }) {
                 return Some(snapshot.clone());
             }
 
@@ -49,7 +50,13 @@ impl RecordingReporter {
                     .updates
                     .iter()
                     .rev()
-                    .find(|snapshot| snapshot.query == query)
+                    .find(|snapshot| {
+                        snapshot.query == query
+                            && snapshot
+                                .matches
+                                .iter()
+                                .any(|file_match| file_match.path.to_string_lossy().contains(query))
+                    })
                     .cloned();
             }
         }
