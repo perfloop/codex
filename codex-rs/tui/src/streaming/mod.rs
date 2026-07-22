@@ -16,6 +16,9 @@ use std::time::Instant;
 
 use crate::markdown_stream::MarkdownStreamCollector;
 use crate::terminal_hyperlinks::HyperlinkLine;
+#[cfg(test)]
+#[path = "benchmark_tests.rs"]
+mod benchmark_tests;
 pub(crate) mod chunking;
 pub(crate) mod commit_tick;
 pub(crate) mod controller;
