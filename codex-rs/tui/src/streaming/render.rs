@@ -13,6 +13,42 @@ use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use ratatui::text::Line;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+
+#[cfg(test)]
+static STREAMING_RENDER_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static STREAMING_RENDER_INPUT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) struct StreamingRenderStats {
+    pub(super) calls: usize,
+    pub(super) input_bytes: usize,
+}
+
+#[cfg(test)]
+pub(super) fn reset_streaming_render_stats() {
+    STREAMING_RENDER_CALLS.store(0, Ordering::Relaxed);
+    STREAMING_RENDER_INPUT_BYTES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn streaming_render_stats() -> StreamingRenderStats {
+    StreamingRenderStats {
+        calls: STREAMING_RENDER_CALLS.load(Ordering::Relaxed),
+        input_bytes: STREAMING_RENDER_INPUT_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+fn record_streaming_render(pending_source: &str) {
+    STREAMING_RENDER_CALLS.fetch_add(1, Ordering::Relaxed);
+    STREAMING_RENDER_INPUT_BYTES.fetch_add(pending_source.len(), Ordering::Relaxed);
+}
 
 /// Incremental render state split at source and rendered-line boundaries.
 ///
@@ -131,6 +167,8 @@ impl StreamingRender {
         }
 
         let pending_source = &raw_source[self.stable_source_len..];
+        #[cfg(test)]
+        record_streaming_render(pending_source);
         let pending =
             render_streaming_markdown_agent_with_links_and_cwd(pending_source, width, Some(cwd));
         if pending.has_reference_link_definition {
