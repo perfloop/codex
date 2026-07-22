@@ -21,8 +21,9 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-const FILE_COUNT: usize = 4_096;
-const BURST_COUNT: usize = 12;
+const FILE_COUNT: usize = 8_192;
+const QUERY_VARIANT_COUNT: usize = 16;
+const BURST_COUNT: usize = 100;
 const UPDATES_PER_BURST: usize = 64;
 const UPDATE_CADENCE: Duration = Duration::from_millis(2);
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -46,7 +47,12 @@ impl Fixture {
         for index in 0..FILE_COUNT {
             let bucket = path.join(format!("bucket-{}", index % 64));
             fs::create_dir_all(&bucket)?;
-            fs::write(bucket.join(format!("file_{index:05}_component.rs")), [])?;
+            fs::write(
+                bucket.join(format!(
+                    "file_{index:05}_needle_00_needle_01_needle_02_needle_03_needle_04_needle_05_needle_06_needle_07_needle_08_needle_09_needle_10_needle_11_needle_12_needle_13_needle_14_needle_15_component.rs"
+                )),
+                [],
+            )?;
         }
 
         Ok(Self { path })
@@ -178,8 +184,8 @@ impl SessionReporter for BurstReporter {
 }
 
 fn query_for(round: usize, update: usize) -> String {
-    let index = (round * UPDATES_PER_BURST + update) % FILE_COUNT;
-    format!("file_{index:05}")
+    let variant = (round * UPDATES_PER_BURST + update) % QUERY_VARIANT_COUNT;
+    format!("needle_{variant:02}")
 }
 
 fn p99(mut latencies: Vec<u128>) -> u128 {
