@@ -22,6 +22,8 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "perfloop-metadata-probe")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -65,6 +67,22 @@ pub struct FileMatch {
 pub enum MatchType {
     File,
     Directory,
+}
+
+#[cfg(feature = "perfloop-metadata-probe")]
+static MATCHER_METADATA_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns and clears metadata probes performed while materializing matcher snapshots.
+#[doc(hidden)]
+pub fn take_matcher_metadata_probe_count() -> usize {
+    #[cfg(feature = "perfloop-metadata-probe")]
+    {
+        MATCHER_METADATA_PROBES.swap(0, Ordering::SeqCst)
+    }
+    #[cfg(not(feature = "perfloop-metadata-probe"))]
+    {
+        0
+    }
 }
 
 impl FileMatch {
@@ -559,6 +577,8 @@ fn matcher_worker(
                             } else {
                                 None
                             };
+                            #[cfg(feature = "perfloop-metadata-probe")]
+                            MATCHER_METADATA_PROBES.fetch_add(1, Ordering::SeqCst);
                             let match_type = if Path::new(full_path).is_dir() {
                                 MatchType::Directory
                             } else {
@@ -1009,6 +1029,34 @@ mod tests {
         assert!(results.matches.iter().any(|m| {
             m.path == std::path::Path::new("docs").join("guides")
                 && m.match_type == MatchType::Directory
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_returns_directory_match_for_followed_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("target-directory")).unwrap();
+        fs::write(dir.path().join("target-directory/child.txt"), "child").unwrap();
+        symlink("target-directory", dir.path().join("linked-directory")).unwrap();
+
+        let results = run(
+            "linked-directory",
+            vec![dir.path().to_path_buf()],
+            FileSearchOptions::default(),
+            /*cancel_flag*/ None,
+        )
+        .expect("run ok");
+
+        assert!(results.matches.iter().any(|file_match| {
+            file_match.path == Path::new("linked-directory")
+                && file_match.match_type == MatchType::Directory
+        }));
+        assert!(results.matches.iter().any(|file_match| {
+            file_match.path == Path::new("linked-directory").join("child.txt")
+                && file_match.match_type == MatchType::File
         }));
     }
 
