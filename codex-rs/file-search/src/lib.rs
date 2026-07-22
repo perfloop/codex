@@ -1,6 +1,7 @@
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::after;
+use crossbeam_channel::bounded;
 use crossbeam_channel::never;
 use crossbeam_channel::select;
 use crossbeam_channel::unbounded;
@@ -141,10 +142,13 @@ pub struct FileSearchSession {
 impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
     pub fn update_query(&self, pattern_text: &str) {
-        let _ = self
-            .inner
-            .work_tx
-            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+        {
+            #[expect(clippy::unwrap_used)]
+            let mut pending_query = self.inner.pending_query.lock().unwrap();
+            pending_query.query = Some(pattern_text.to_string());
+            pending_query.completion_count = pending_query.completion_count.saturating_add(1);
+        }
+        let _ = self.inner.query_tx.try_send(());
     }
 }
 
@@ -174,6 +178,7 @@ pub fn create_session(
     };
     let override_matcher = build_override_matcher(primary_search_directory, &exclude)?;
     let (work_tx, work_rx) = unbounded();
+    let (query_tx, query_rx) = bounded(1);
 
     let notify_tx = work_tx.clone();
     let notify = Arc::new(move || {
@@ -199,10 +204,12 @@ pub fn create_session(
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
         work_tx,
+        query_tx,
+        pending_query: Mutex::new(PendingQuery::default()),
     });
 
     let matcher_inner = inner.clone();
-    thread::spawn(move || matcher_worker(matcher_inner, work_rx, nucleo));
+    thread::spawn(move || matcher_worker(matcher_inner, work_rx, query_rx, nucleo));
 
     let walker_inner = inner.clone();
     thread::spawn(move || walker_worker(walker_inner, override_matcher, injector));
@@ -352,10 +359,17 @@ struct SessionInner {
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
+    query_tx: Sender<()>,
+    pending_query: Mutex<PendingQuery>,
+}
+
+#[derive(Default)]
+struct PendingQuery {
+    query: Option<String>,
+    completion_count: usize,
 }
 
 enum WorkSignal {
-    QueryUpdated(String),
     NucleoNotify,
     WalkComplete,
     Shutdown,
@@ -483,6 +497,7 @@ fn walker_worker(
 fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
+    query_rx: Receiver<()>,
     mut nucleo: Nucleo<Arc<str>>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
@@ -495,27 +510,42 @@ fn matcher_worker(
     let mut next_notify = never();
     let mut will_notify = false;
     let mut walk_complete = false;
+    let mut pending_completions: usize = 0;
 
     loop {
         select! {
+            recv(query_rx) -> wake => {
+                if wake.is_err() {
+                    break;
+                }
+                let (query, completion_count) = {
+                    #[expect(clippy::unwrap_used)]
+                    let mut pending_query = inner.pending_query.lock().unwrap();
+                    (
+                        pending_query.query.take(),
+                        std::mem::take(&mut pending_query.completion_count),
+                    )
+                };
+                pending_completions = pending_completions.saturating_add(completion_count);
+                if let Some(query) = query {
+                    let append = query.starts_with(&last_query);
+                    nucleo.pattern.reparse(
+                        0,
+                        &query,
+                        CaseMatching::Ignore,
+                        Normalization::Smart,
+                        append,
+                    );
+                    last_query = query;
+                    will_notify = true;
+                    next_notify = after(Duration::from_millis(0));
+                }
+            }
             recv(work_rx) -> signal => {
                 let Ok(signal) = signal else {
                     break;
                 };
                 match signal {
-                    WorkSignal::QueryUpdated(query) => {
-                        let append = query.starts_with(&last_query);
-                        nucleo.pattern.reparse(
-                            0,
-                            &query,
-                            CaseMatching::Ignore,
-                            Normalization::Smart,
-                            append,
-                        );
-                        last_query = query;
-                        will_notify = true;
-                        next_notify = after(Duration::from_millis(0));
-                    }
                     WorkSignal::NucleoNotify => {
                         if !will_notify {
                             will_notify = true;
@@ -584,7 +614,14 @@ fn matcher_worker(
                     inner.reporter.on_update(&snapshot);
                 }
                 if !status.running && walk_complete {
-                    inner.reporter.on_complete();
+                    #[expect(clippy::unwrap_used)]
+                    let has_pending_query = inner.pending_query.lock().unwrap().query.is_some();
+                    if !has_pending_query {
+                        for _ in 0..pending_completions.max(1) {
+                            inner.reporter.on_complete();
+                        }
+                        pending_completions = 0;
+                    }
                 }
             }
             default(Duration::from_millis(100)) => {
@@ -597,8 +634,16 @@ fn matcher_worker(
         }
     }
 
-    // If we cancelled or otherwise exited the loop, make sure the reporter is notified.
-    inner.reporter.on_complete();
+    // If we cancelled or otherwise exited the loop, make sure every outstanding
+    // update and the cancellation itself are reported as complete.
+    #[expect(clippy::unwrap_used)]
+    let pending_completions = pending_completions.saturating_add({
+        let mut pending_query = inner.pending_query.lock().unwrap();
+        std::mem::take(&mut pending_query.completion_count)
+    });
+    for _ in 0..pending_completions.max(1) {
+        inner.reporter.on_complete();
+    }
 
     Ok(())
 }
