@@ -165,6 +165,8 @@ where
     pub last_known_cursor_pos: Position,
     /// Count of visible history rows rendered above the viewport in inline mode.
     visible_history_rows: u16,
+    /// Whether a reset, resize, or viewport change makes the terminal contents unknown.
+    force_full_clear: bool,
 }
 
 impl<B> Drop for Terminal<B>
@@ -242,6 +244,7 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             visible_history_rows: 0,
+            force_full_clear: true,
         }
     }
 
@@ -297,12 +300,18 @@ where
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
     pub fn flush(&mut self) -> io::Result<()> {
-        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+        let updates = diff_buffers(
+            self.previous_buffer(),
+            self.current_buffer(),
+            self.force_full_clear,
+        );
         let last_put_command = updates.iter().rfind(|command| command.is_put());
         if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
             self.last_known_cursor_pos = Position { x, y };
         }
-        draw(&mut self.backend, updates.into_iter())
+        draw(&mut self.backend, updates.into_iter())?;
+        self.force_full_clear = false;
+        Ok(())
     }
 
     /// Updates the Terminal so that internal buffers match the requested area.
@@ -311,6 +320,7 @@ where
     /// of the screen.
     pub fn resize(&mut self, screen_size: Size) -> io::Result<()> {
         self.last_known_screen_size = screen_size;
+        self.force_full_clear = true;
         Ok(())
     }
 
@@ -319,6 +329,7 @@ where
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
+        self.force_full_clear = true;
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
@@ -490,7 +501,7 @@ where
         self.backend.set_cursor_position(position)?;
         self.backend.clear_region(ClearType::AfterCursor)?;
         // Reset the back buffer to make sure the next update will redraw everything.
-        self.previous_buffer_mut().reset();
+        self.invalidate_viewport();
         Ok(())
     }
 
@@ -499,6 +510,7 @@ where
     /// content outside ratatui's knowledge.
     pub fn invalidate_viewport(&mut self) {
         self.previous_buffer_mut().reset();
+        self.force_full_clear = true;
     }
 
     /// Clear the entire visible screen (not just the viewport) and force a full redraw.
@@ -512,7 +524,7 @@ where
         self.set_cursor_position(home)?;
         std::io::Write::flush(&mut self.backend)?;
         self.visible_history_rows = 0;
-        self.previous_buffer_mut().reset();
+        self.invalidate_viewport();
         Ok(())
     }
 
@@ -531,7 +543,7 @@ where
         std::io::Write::flush(&mut self.backend)?;
         self.last_known_cursor_pos = Position { x: 0, y: 0 };
         self.visible_history_rows = 0;
-        self.previous_buffer_mut().reset();
+        self.invalidate_viewport();
         Ok(())
     }
 
@@ -562,11 +574,14 @@ enum DrawCommand {
     ClearToEnd { x: u16, y: u16, bg: Color },
 }
 
-fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
+fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
-    let mut updates = vec![];
+    if a.area.is_empty() {
+        return vec![];
+    }
+
     let mut last_nonblank_columns = vec![0; a.area.height as usize];
     for y in 0..a.area.height {
         let row_start = y as usize * a.area.width as usize;
@@ -590,12 +605,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
             column += width.max(1); // treat zero-width symbols as width 1
         }
 
-        if last_nonblank_column + 1 < row.len() {
-            let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
-            updates.push(DrawCommand::ClearToEnd { x, y, bg });
-        }
-
-        last_nonblank_columns[y as usize] = last_nonblank_column as u16;
+        last_nonblank_columns[y as usize] = last_nonblank_column;
     }
 
     // Cells invalidated by drawing/replacing preceding multi-width characters:
@@ -603,11 +613,26 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     // Cells from the current buffer to skip due to preceding multi-width characters taking
     // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
     let mut to_skip: usize = 0;
+    let mut updates = vec![];
+    let mut clears = vec![];
+    let mut last_changed_column: Option<usize> = None;
+    let width = a.area.width as usize;
     for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
-        if !current.skip && (current != previous || invalidated > 0) && to_skip == 0 {
+        let current_width = display_width(current.symbol());
+        let affected_width = std::cmp::max(current_width, display_width(previous.symbol()));
+        let changed = current != previous;
+        let row = i / width;
+        if changed {
+            let column = i % width;
+            let changed_end = column + affected_width.max(1).saturating_sub(1);
+            last_changed_column = Some(
+                last_changed_column
+                    .map_or(changed_end, |last_changed| last_changed.max(changed_end)),
+            );
+        }
+        if !current.skip && (changed || invalidated > 0) && to_skip == 0 {
             let (x, y) = a.pos_of(i);
-            let row = i / a.area.width as usize;
-            if x <= last_nonblank_columns[row] {
+            if x as usize <= last_nonblank_columns[row] {
                 updates.push(DrawCommand::Put {
                     x,
                     y,
@@ -616,15 +641,29 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
             }
         }
 
-        to_skip = display_width(current.symbol()).saturating_sub(1);
-
-        let affected_width = std::cmp::max(
-            display_width(current.symbol()),
-            display_width(previous.symbol()),
-        );
+        to_skip = current_width.saturating_sub(1);
         invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
+
+        if i % width == width - 1 {
+            let last_nonblank_column = last_nonblank_columns[row];
+            if last_nonblank_column + 1 < width
+                && (force_full_clear
+                    || last_changed_column
+                        .is_some_and(|last_changed| last_changed > last_nonblank_column))
+            {
+                let row_start = i + 1 - width;
+                let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
+                clears.push(DrawCommand::ClearToEnd {
+                    x,
+                    y,
+                    bg: current.bg,
+                });
+            }
+            last_changed_column = None;
+        }
     }
-    updates
+    clears.extend(updates);
+    clears
 }
 
 fn draw<I>(writer: &mut impl Write, commands: I) -> io::Result<()>
@@ -871,7 +910,7 @@ mod tests {
             .expect("cell should exist")
             .set_symbol("X");
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, false);
 
         let clear_count = commands
             .iter()
@@ -890,6 +929,31 @@ mod tests {
     }
 
     #[test]
+    fn diff_buffers_skips_unchanged_blank_tail_unless_invalidated() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        previous.set_string(0, 0, "old", Style::default());
+        next.set_string(0, 0, "new", Style::default());
+
+        let commands = diff_buffers(&previous, &next, false);
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { .. })),
+            "unchanged blank tail should not be cleared; commands: {commands:?}",
+        );
+
+        let invalidated_commands = diff_buffers(&previous, &next, true);
+        assert!(
+            invalidated_commands
+                .iter()
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 3, y: 0, .. })),
+            "invalidated viewport must clear the blank tail; commands: {invalidated_commands:?}",
+        );
+    }
+
+    #[test]
     fn diff_buffers_clear_to_end_starts_after_wide_char() {
         let area = Rect::new(0, 0, 10, 1);
         let mut previous = Buffer::empty(area);
@@ -898,12 +962,39 @@ mod tests {
         previous.set_string(0, 0, "中文", Style::default());
         next.set_string(0, 0, "中", Style::default());
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, false);
         assert!(
             commands
                 .iter()
                 .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. })),
             "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_viewport_forces_tail_clear_on_next_draw() {
+        let mut terminal =
+            Terminal::with_options(CaptureBackend::new(/*width*/ 8, /*height*/ 1))
+                .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 8, 1));
+        terminal
+            .draw(|frame| {
+                frame.buffer_mut().set_string(0, 0, "old", Style::default());
+            })
+            .expect("initial draw");
+
+        terminal.backend_mut().output.clear();
+        terminal.invalidate_viewport();
+        terminal
+            .draw(|frame| {
+                frame.buffer_mut().set_string(0, 0, "new", Style::default());
+            })
+            .expect("invalidated draw");
+
+        assert!(
+            terminal.backend().output().contains("\x1b[K"),
+            "invalidated draw must clear the trailing cells; output: {:?}",
+            terminal.backend().output(),
         );
     }
 
