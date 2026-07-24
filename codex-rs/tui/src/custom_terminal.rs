@@ -300,6 +300,13 @@ where
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
     pub fn flush(&mut self) -> io::Result<()> {
+        self.flush_updates()?;
+        Backend::flush(&mut self.backend)?;
+        self.force_full_clear = false;
+        Ok(())
+    }
+
+    fn flush_updates(&mut self) -> io::Result<()> {
         let updates = diff_buffers(
             self.previous_buffer(),
             self.current_buffer(),
@@ -309,9 +316,7 @@ where
         if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
             self.last_known_cursor_pos = Position { x, y };
         }
-        draw(&mut self.backend, updates.into_iter())?;
-        self.force_full_clear = false;
-        Ok(())
+        draw(&mut self.backend, updates.into_iter())
     }
 
     /// Updates the Terminal so that internal buffers match the requested area.
@@ -429,8 +434,9 @@ where
         let cursor_position = frame.cursor_position;
         let cursor_style = frame.cursor_style;
 
-        // Draw to stdout
-        self.flush()?;
+        // Draw to stdout. Keep a forced recovery clear armed until the backend
+        // confirms that every queued write has been flushed below.
+        self.flush_updates()?;
 
         match cursor_position {
             None => self.hide_cursor()?,
@@ -444,6 +450,7 @@ where
         self.swap_buffers();
 
         Backend::flush(&mut self.backend)?;
+        self.force_full_clear = false;
 
         Ok(())
     }
@@ -903,6 +910,112 @@ mod tests {
         }
     }
 
+    struct BufferedBackend {
+        pending: Vec<u8>,
+        parser: vt100::Parser,
+        size: Size,
+        cursor: Position,
+        fail_next_flush: bool,
+    }
+
+    impl BufferedBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                pending: Vec::new(),
+                parser: vt100::Parser::new(height, width, 0),
+                size: Size { width, height },
+                cursor: Position::ORIGIN,
+                fail_next_flush: false,
+            }
+        }
+    }
+
+    impl Write for BufferedBackend {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.pending.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for BufferedBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.cursor)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: self.size,
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_next_flush {
+                self.pending.clear();
+                self.fail_next_flush = false;
+                return Err(io::Error::other("discarded buffered terminal output"));
+            }
+            self.parser.process(&self.pending);
+            self.pending.clear();
+            Ok(())
+        }
+
+        fn scroll_region_up(
+            &mut self,
+            _region: std::ops::Range<u16>,
+            _scroll_by: u16,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn scroll_region_down(
+            &mut self,
+            _region: std::ops::Range<u16>,
+            _scroll_by: u16,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn draw_blank(terminal: &mut Terminal<BufferedBackend>) -> io::Result<()> {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            frame.buffer_mut().set_style(area, Style::default());
+        })
+    }
+
     #[test]
     fn diff_buffers_does_not_emit_clear_to_end_for_full_width_row() {
         let area = Rect::new(0, 0, 3, 2);
@@ -1022,6 +1135,62 @@ mod tests {
                     .contains(stale),
                 "invalidated blank {width}-column viewport retained stale content: {:?}",
                 terminal.backend().vt100().screen().contents(),
+            );
+        }
+    }
+
+    #[test]
+    fn failed_backend_flush_retries_forced_viewport_clear() {
+        for (width, stale) in [(12, "stale"), (1, "X")] {
+            let mut terminal = Terminal::with_options_and_cursor_position(
+                BufferedBackend::new(width, /*height*/ 1),
+                Position::ORIGIN,
+            )
+            .expect("terminal");
+            terminal.set_viewport_area(Rect::new(0, 0, width, 1));
+            draw_blank(&mut terminal).expect("initial blank draw");
+
+            terminal
+                .backend_mut()
+                .write_all(format!("\x1b[H{stale}").as_bytes())
+                .expect("buffer direct stale text");
+            Backend::flush(terminal.backend_mut()).expect("publish direct stale text");
+            assert!(
+                terminal
+                    .backend()
+                    .parser
+                    .screen()
+                    .contents()
+                    .contains(stale),
+                "direct output should seed stale content at width {width}",
+            );
+
+            terminal.invalidate_viewport();
+            terminal.backend_mut().fail_next_flush = true;
+            assert!(
+                draw_blank(&mut terminal).is_err(),
+                "discarded backend flush should fail the invalidated frame",
+            );
+            assert!(
+                terminal
+                    .backend()
+                    .parser
+                    .screen()
+                    .contents()
+                    .contains(stale),
+                "discarded output must not alter the parser",
+            );
+
+            draw_blank(&mut terminal).expect("retry invalidated blank draw");
+            assert!(
+                !terminal
+                    .backend()
+                    .parser
+                    .screen()
+                    .contents()
+                    .contains(stale),
+                "retry retained stale content at width {width}: {:?}",
+                terminal.backend().parser.screen().contents(),
             );
         }
     }
