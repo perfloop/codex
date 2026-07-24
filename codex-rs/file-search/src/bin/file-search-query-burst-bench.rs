@@ -18,7 +18,6 @@ const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
 const BURSTS_PER_SAMPLE: usize = 48;
 const TYPED_CHAR_CADENCE: Duration = Duration::from_millis(9);
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_QUERY: &str = "zz";
 
 fn main() {
@@ -70,16 +69,15 @@ fn run() -> anyhow::Result<()> {
         None,
     )?;
 
-    reporter.wait_for_initial_completion()?;
-    let sent_at = Instant::now();
+    reporter.wait_for_initial_completion();
     let update_id = session.update_query_with_id(WARMUP_QUERY);
-    let warmup = reporter.wait_for_update(update_id, WARMUP_QUERY, sent_at)?;
+    let warmup = reporter.wait_for_update(update_id, WARMUP_QUERY);
     anyhow::ensure!(
         warmup.snapshot.scanned_file_count >= FILE_COUNT,
         "warmup scanned only {} of {FILE_COUNT} fixture files",
         warmup.snapshot.scanned_file_count
     );
-    reporter.wait_for_completion_after(warmup.observed_at)?;
+    reporter.wait_for_completion_after(warmup.sequence);
 
     metrics.reset();
     reporter.reset();
@@ -139,8 +137,8 @@ fn run_typed_query_burst(
     }
     let (update_id, query, sent_at) =
         final_update.ok_or_else(|| anyhow::anyhow!("burst had no final query"))?;
-    let callback = reporter.wait_for_final_update(update_id, query, sent_at, expected_file)?;
-    reporter.wait_for_completion_after(callback.observed_at)?;
+    let callback = reporter.wait_for_final_update(update_id, query, expected_file);
+    reporter.wait_for_completion_after(callback.sequence);
     Ok(callback
         .observed_at
         .saturating_duration_since(sent_at)
@@ -171,7 +169,8 @@ struct BurstReporter {
 #[derive(Default)]
 struct ReporterState {
     updates: Vec<ObservedUpdate>,
-    completions: Vec<Instant>,
+    completions: Vec<u64>,
+    sequence: u64,
     stale: u64,
     same_text_stale: u64,
 }
@@ -180,6 +179,7 @@ struct ReporterState {
 struct ObservedUpdate {
     snapshot: FileSearchSnapshot,
     observed_at: Instant,
+    sequence: u64,
 }
 
 impl BurstReporter {
@@ -195,24 +195,17 @@ impl BurstReporter {
         *self.lock() = ReporterState::default();
     }
 
-    fn wait_for_initial_completion(&self) -> anyhow::Result<()> {
-        self.wait(|state| (!state.completions.is_empty()).then_some(()))
+    fn wait_for_initial_completion(&self) {
+        self.wait(|state| (!state.completions.is_empty()).then_some(()));
     }
 
-    fn wait_for_update(
-        &self,
-        update_id: u64,
-        query: &str,
-        sent_at: Instant,
-    ) -> anyhow::Result<ObservedUpdate> {
+    fn wait_for_update(&self, update_id: u64, query: &str) -> ObservedUpdate {
         self.wait(|state| {
             state
                 .updates
                 .iter()
                 .find(|update| {
-                    update.snapshot.update_id == update_id
-                        && update.snapshot.query == query
-                        && update.observed_at >= sent_at
+                    update.snapshot.update_id == update_id && update.snapshot.query == query
                 })
                 .cloned()
         })
@@ -222,9 +215,8 @@ impl BurstReporter {
         &self,
         update_id: u64,
         query: &str,
-        sent_at: Instant,
         expected_file: &str,
-    ) -> anyhow::Result<ObservedUpdate> {
+    ) -> ObservedUpdate {
         self.wait(|state| {
             state
                 .updates
@@ -232,21 +224,20 @@ impl BurstReporter {
                 .find(|update| {
                     update.snapshot.update_id == update_id
                         && update.snapshot.query == query
-                        && update.observed_at >= sent_at
                         && snapshot_contains_file(&update.snapshot, expected_file)
                 })
                 .cloned()
         })
     }
 
-    fn wait_for_completion_after(&self, observed_at: Instant) -> anyhow::Result<()> {
+    fn wait_for_completion_after(&self, update_sequence: u64) {
         self.wait(|state| {
             state
                 .completions
                 .iter()
-                .any(|completion| *completion >= observed_at)
+                .any(|completion| *completion > update_sequence)
                 .then_some(())
-        })
+        });
     }
 
     fn outcomes(&self) -> (u64, u64, u64) {
@@ -258,20 +249,16 @@ impl BurstReporter {
         )
     }
 
-    fn wait<T>(&self, predicate: impl Fn(&ReporterState) -> Option<T>) -> anyhow::Result<T> {
-        let deadline = Instant::now() + CALLBACK_TIMEOUT;
+    fn wait<T>(&self, predicate: impl Fn(&ReporterState) -> Option<T>) -> T {
         let mut state = self.lock();
         loop {
             if let Some(value) = predicate(&state) {
-                return Ok(value);
+                return value;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            anyhow::ensure!(!remaining.is_zero(), "timed out waiting for file-search");
-            let (next, _) = self
+            state = self
                 .changed
-                .wait_timeout(state, remaining)
+                .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
         }
     }
 
@@ -288,17 +275,23 @@ impl SessionReporter for BurstReporter {
         let (latest_id, latest_query) = self.metrics.latest();
         let stale = snapshot.update_id != latest_id;
         let mut state = self.lock();
+        state.sequence += 1;
+        let sequence = state.sequence;
         state.stale += stale as u64;
         state.same_text_stale += (stale && snapshot.query == latest_query) as u64;
         state.updates.push(ObservedUpdate {
             snapshot: snapshot.clone(),
             observed_at,
+            sequence,
         });
         self.changed.notify_all();
     }
 
     fn on_complete(&self) {
-        self.lock().completions.push(Instant::now());
+        let mut state = self.lock();
+        state.sequence += 1;
+        let sequence = state.sequence;
+        state.completions.push(sequence);
         self.changed.notify_all();
     }
 }

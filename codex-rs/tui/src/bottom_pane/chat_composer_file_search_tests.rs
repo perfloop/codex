@@ -39,18 +39,34 @@ fn file_search_queries(rx: &mut UnboundedReceiver<AppEvent>) -> Vec<String> {
 #[test]
 fn file_search_emission_uses_each_non_burst_prefix_and_one_burst_result() {
     let (mut typed, mut typed_events) = composer();
+    let mut typed_now = Instant::now();
     for ch in ['@', 'z', 'z'] {
-        let _ = typed.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-        std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-        assert!(typed.flush_paste_burst_if_due());
+        let _ = typed.handle_input_basic_with_time(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            typed_now,
+        );
+        typed.sync_popups();
+        typed_now += ChatComposer::recommended_paste_flush_delay();
+        assert!(typed.handle_paste_burst_flush(typed_now));
+        typed.sync_popups();
     }
     for _ in 0..2 {
-        let _ = typed.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let _ = typed.handle_input_basic_with_time(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            typed_now,
+        );
+        typed.sync_popups();
+        typed_now += Duration::from_millis(1);
     }
     for ch in ['a', 'b', 'c'] {
-        let _ = typed.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-        std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-        assert!(typed.flush_paste_burst_if_due());
+        let _ = typed.handle_input_basic_with_time(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            typed_now,
+        );
+        typed.sync_popups();
+        typed_now += ChatComposer::recommended_paste_flush_delay();
+        assert!(typed.handle_paste_burst_flush(typed_now));
+        typed.sync_popups();
     }
     assert_eq!(
         file_search_queries(&mut typed_events),
