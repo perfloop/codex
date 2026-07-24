@@ -8,6 +8,7 @@ use std::hint::black_box;
 use std::io;
 use std::io::Write;
 use std::mem;
+use std::time::Instant;
 
 // `custom_terminal` only uses this warning on the constructor path that probes
 // a real terminal. The driver supplies a cursor position, so a no-op shim keeps
@@ -36,6 +37,7 @@ use ratatui::style::Style;
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 40;
+const FRAMES_PER_SAMPLE: u64 = 1_024;
 
 struct CaptureBackend {
     output: Vec<u8>,
@@ -157,15 +159,10 @@ fn render(terminal: &mut Terminal<CaptureBackend>, draw: impl FnOnce(&mut Buffer
         .expect("frame should draw");
 }
 
-fn sparse(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
+fn sparse(terminal: &mut Terminal<CaptureBackend>, label: &str) {
     render(terminal, |buffer, area| {
         buffer.set_style(area, Style::default());
-        buffer.set_string(
-            0,
-            0,
-            format!("stream tick {tick}"),
-            Style::default().fg(Color::Cyan),
-        );
+        buffer.set_string(0, 0, label, Style::default().fg(Color::Cyan));
         for y in (4..area.height).step_by(8) {
             buffer.set_string(
                 0,
@@ -177,10 +174,10 @@ fn sparse(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
     });
 }
 
-fn tail_content(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
+fn tail_content(terminal: &mut Terminal<CaptureBackend>, label: &str) {
     render(terminal, |buffer, area| {
         buffer.set_style(area, Style::default());
-        buffer.set_string(0, 0, format!("stream tick {tick}"), Style::default());
+        buffer.set_string(0, 0, label, Style::default());
         for y in 0..area.height {
             buffer.set_string(
                 area.width.saturating_sub(9),
@@ -205,31 +202,54 @@ fn clear_to_end_count(bytes: &[u8]) -> usize {
         .count()
 }
 
+fn labels(tick: u64) -> Vec<String> {
+    (0..FRAMES_PER_SAMPLE)
+        .map(|frame| format!("stream tick {:08}", tick.saturating_add(frame)))
+        .collect()
+}
+
 #[allow(clippy::print_stdout)]
 fn sample(tick: u64, tail_changes: bool) {
+    let labels = labels(tick);
     let mut terminal = terminal(WIDTH, HEIGHT);
     if tail_changes {
-        tail_content(&mut terminal, tick.saturating_sub(1));
+        tail_content(&mut terminal, &labels[0]);
     } else {
-        sparse(&mut terminal, tick.saturating_sub(1));
+        let previous = format!("stream tick {:08}", tick.saturating_sub(1));
+        sparse(&mut terminal, &previous);
     }
     terminal.backend_mut().take_output();
-    sparse(&mut terminal, tick);
+    terminal.backend_mut().output.reserve(2 * 1024 * 1024);
 
+    let started = Instant::now();
+    if tail_changes {
+        for label in &labels {
+            tail_content(&mut terminal, label);
+            sparse(&mut terminal, label);
+        }
+    } else {
+        for label in &labels {
+            sparse(&mut terminal, label);
+        }
+    }
+    let elapsed_ns = started.elapsed().as_nanos() as f64 / FRAMES_PER_SAMPLE as f64;
     let output = terminal.backend_mut().take_output();
-    let bytes = black_box(output.len());
-    let clears = black_box(clear_to_end_count(&output));
-    let (bytes_metric, clears_metric) = if tail_changes {
+    let bytes = black_box(output.len() as f64 / FRAMES_PER_SAMPLE as f64);
+    let clears = black_box(clear_to_end_count(&output) as f64 / FRAMES_PER_SAMPLE as f64);
+    let (time_metric, bytes_metric, clears_metric) = if tail_changes {
         (
-            "terminal_output_bytes_per_tail_change",
-            "clear_to_end_commands_per_tail_change",
+            "in_memory_terminal_draw_ns_per_tail_change_cycle",
+            "terminal_output_bytes_per_tail_change_cycle",
+            "clear_to_end_commands_per_tail_change_cycle",
         )
     } else {
         (
+            "in_memory_terminal_draw_ns_per_sparse_one_row_change_frame",
             "terminal_output_bytes_per_sparse_one_row_change",
             "clear_to_end_commands_per_sparse_one_row_change",
         )
     };
+    println!("{{\"metric\":\"{time_metric}\",\"value\":{elapsed_ns}}}");
     println!("{{\"metric\":\"{bytes_metric}\",\"value\":{bytes}}}");
     println!("{{\"metric\":\"{clears_metric}\",\"value\":{clears}}}");
 }
@@ -304,10 +324,10 @@ fn verify() {
     assert!(clear_to_end_count(&modifiers.backend_mut().take_output()) > 0);
 
     let mut unchanged = terminal(WIDTH, HEIGHT);
-    sparse(&mut unchanged, 17);
+    sparse(&mut unchanged, "stream tick 00000017");
     let before = unchanged.backend().parser.screen().contents();
     unchanged.backend_mut().take_output();
-    sparse(&mut unchanged, 17);
+    sparse(&mut unchanged, "stream tick 00000017");
     assert_eq!(before, unchanged.backend().parser.screen().contents());
 }
 
