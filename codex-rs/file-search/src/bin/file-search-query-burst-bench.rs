@@ -21,9 +21,8 @@ use std::time::Instant;
 
 const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
-// One sample contains repeated identity-checked bursts and emits p50, mean,
-// and p95 callback-latency distribution evidence without treating one scheduler
-// outlier as representative.
+// One sample averages repeated identity-checked typed bursts before emitting
+// the supporting newest-query callback-latency observation.
 const BURSTS_PER_SAMPLE: usize = 48;
 // PasteBurst treats an 8-ms-or-shorter plain-character interval as a paste. The
 // TUI's own human-input helper sleeps its recommended 8-ms-plus-1-ms delay and
@@ -80,26 +79,18 @@ fn run() -> anyhow::Result<()> {
     queue_metrics.reset();
     reporter.reset();
 
-    let mut newest_query_callback_latencies_ns = Vec::with_capacity(BURSTS_PER_SAMPLE);
+    let mut total_newest_query_callback_latency_ns = 0_u128;
     for _ in 0..BURSTS_PER_SAMPLE {
-        newest_query_callback_latencies_ns.push(run_typed_query_burst(
+        total_newest_query_callback_latency_ns += u128::from(run_typed_query_burst(
             &session,
             &queries,
             &reporter,
             &fixture.final_result_file,
         )?);
     }
-    let newest_query_callback_latency_mean_ns = (newest_query_callback_latencies_ns
-        .iter()
-        .map(|latency| u128::from(*latency))
-        .sum::<u128>()
+    let newest_query_callback_latency_ns = (total_newest_query_callback_latency_ns
         / BURSTS_PER_SAMPLE as u128)
         .min(u128::from(u64::MAX)) as u64;
-    newest_query_callback_latencies_ns.sort_unstable();
-    let newest_query_callback_latency_p50_ns =
-        percentile_ns(&newest_query_callback_latencies_ns, /*percent*/ 50);
-    let newest_query_callback_latency_p95_ns =
-        percentile_ns(&newest_query_callback_latencies_ns, /*percent*/ 95);
     let queue_stats = queue_metrics.queue_stats();
     let expected_logical_update_count = UPDATE_COUNT * BURSTS_PER_SAMPLE;
     if queue_stats.logical_update_count != expected_logical_update_count {
@@ -111,16 +102,8 @@ fn run() -> anyhow::Result<()> {
     let outcomes = reporter.outcomes();
 
     emit(
-        "newest_query_callback_latency_p50_ns",
-        newest_query_callback_latency_p50_ns,
-    );
-    emit(
-        "newest_query_callback_latency_mean_ns",
-        newest_query_callback_latency_mean_ns,
-    );
-    emit(
-        "newest_query_callback_latency_p95_ns",
-        newest_query_callback_latency_p95_ns,
+        "newest_query_callback_latency_ns",
+        newest_query_callback_latency_ns,
     );
     emit(
         "query_signal_peak_depth",
@@ -227,19 +210,6 @@ fn emit(metric: &str, value: u64) {
 
 fn usize_to_u64(value: usize) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
-}
-
-fn percentile_ns(sorted_latencies: &[u64], percent: usize) -> u64 {
-    sorted_latencies
-        .get(
-            sorted_latencies
-                .len()
-                .saturating_mul(percent)
-                .div_ceil(100)
-                .saturating_sub(1),
-        )
-        .copied()
-        .unwrap_or_default()
 }
 
 struct Fixture {
