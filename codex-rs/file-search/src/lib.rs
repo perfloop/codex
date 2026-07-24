@@ -22,9 +22,13 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "perfloop-bench")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+#[cfg(feature = "perfloop-bench")]
+use std::time::Instant;
 use tokio::process::Command;
 
 #[cfg(test)]
@@ -37,6 +41,11 @@ use nucleo::pattern::Pattern;
 mod cli;
 
 pub use cli::Cli;
+
+#[cfg(feature = "perfloop-bench")]
+type BenchQueueMetricsArg = Option<Arc<BenchQueueMetrics>>;
+#[cfg(not(feature = "perfloop-bench"))]
+type BenchQueueMetricsArg = ();
 
 /// A single match result returned from the search.
 ///
@@ -94,6 +103,9 @@ pub struct FileSearchSnapshot {
     pub total_match_count: usize,
     pub scanned_file_count: usize,
     pub walk_complete: bool,
+    #[cfg(feature = "perfloop-bench")]
+    #[doc(hidden)]
+    pub update_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -141,10 +153,45 @@ pub struct FileSearchSession {
 impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
     pub fn update_query(&self, pattern_text: &str) {
-        let _ = self
+        #[cfg(feature = "perfloop-bench")]
+        {
+            let _ = self.update_query_with_id(pattern_text);
+        }
+        #[cfg(not(feature = "perfloop-bench"))]
+        {
+            let _ = self.inner.work_tx.send(WorkSignal::QueryUpdated {
+                query: pattern_text.to_string(),
+            });
+        }
+    }
+
+    #[cfg(feature = "perfloop-bench")]
+    #[doc(hidden)]
+    pub fn update_query_with_id(&self, pattern_text: &str) -> u64 {
+        let update_id = self
+            .inner
+            .next_update_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let enqueued_at = Instant::now();
+        if let Some(metrics) = &self.inner.bench_queue_metrics {
+            metrics.record_enqueued(update_id, pattern_text);
+        }
+        let delivered = self
             .inner
             .work_tx
-            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+            .send(WorkSignal::QueryUpdated {
+                query: pattern_text.to_string(),
+                update_id,
+                enqueued_at,
+            })
+            .is_ok();
+        if !delivered {
+            if let Some(metrics) = &self.inner.bench_queue_metrics {
+                metrics.record_send_failed();
+            }
+        }
+        update_id
     }
 }
 
@@ -161,6 +208,46 @@ pub fn create_session(
     reporter: Arc<dyn SessionReporter>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<FileSearchSession> {
+    #[cfg(feature = "perfloop-bench")]
+    let bench_queue_metrics = None;
+    #[cfg(not(feature = "perfloop-bench"))]
+    let bench_queue_metrics = ();
+    create_session_inner(
+        search_directories,
+        options,
+        reporter,
+        cancel_flag,
+        bench_queue_metrics,
+    )
+}
+
+#[cfg(feature = "perfloop-bench")]
+#[doc(hidden)]
+pub fn create_session_with_bench_metrics(
+    search_directories: Vec<PathBuf>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    bench_queue_metrics: Arc<BenchQueueMetrics>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<FileSearchSession> {
+    create_session_inner(
+        search_directories,
+        options,
+        reporter,
+        cancel_flag,
+        Some(bench_queue_metrics),
+    )
+}
+
+fn create_session_inner(
+    search_directories: Vec<PathBuf>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    bench_queue_metrics: BenchQueueMetricsArg,
+) -> anyhow::Result<FileSearchSession> {
+    #[cfg(not(feature = "perfloop-bench"))]
+    let _ = bench_queue_metrics;
     let FileSearchOptions {
         limit,
         exclude,
@@ -199,6 +286,10 @@ pub fn create_session(
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
         work_tx,
+        #[cfg(feature = "perfloop-bench")]
+        bench_queue_metrics,
+        #[cfg(feature = "perfloop-bench")]
+        next_update_id: AtomicU64::new(0),
     });
 
     let matcher_inner = inner.clone();
@@ -342,6 +433,100 @@ fn create_pattern(pattern: &str) -> Pattern {
     )
 }
 
+#[cfg(feature = "perfloop-bench")]
+#[derive(Default)]
+#[doc(hidden)]
+pub struct BenchQueueMetrics {
+    inner: Mutex<BenchQueueMetricsState>,
+}
+
+#[cfg(feature = "perfloop-bench")]
+#[derive(Default)]
+struct BenchQueueMetricsState {
+    depth: usize,
+    peak_depth: usize,
+    ages_ns: Vec<u64>,
+    latest_update_id: u64,
+    latest_query: String,
+}
+
+#[cfg(feature = "perfloop-bench")]
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct BenchQueueStats {
+    pub peak_depth: usize,
+    pub p99_age_ns: u64,
+    pub resolved_query_count: usize,
+}
+
+#[cfg(feature = "perfloop-bench")]
+impl BenchQueueMetrics {
+    #[doc(hidden)]
+    pub fn reset(&self) {
+        *self.lock_state() = BenchQueueMetricsState::default();
+    }
+
+    #[doc(hidden)]
+    pub fn latest_query_identity(&self) -> (u64, String) {
+        let state = self.lock_state();
+        (state.latest_update_id, state.latest_query.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn queue_stats(&self) -> BenchQueueStats {
+        let state = self.lock_state();
+        let mut ages_ns = state.ages_ns.clone();
+        let peak_depth = state.peak_depth;
+        drop(state);
+
+        ages_ns.sort_unstable();
+        let p99_age_ns = ages_ns
+            .get(
+                ages_ns
+                    .len()
+                    .saturating_mul(99)
+                    .div_ceil(100)
+                    .saturating_sub(1),
+            )
+            .copied()
+            .unwrap_or_default();
+        BenchQueueStats {
+            peak_depth,
+            p99_age_ns,
+            resolved_query_count: ages_ns.len(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn record_enqueued(&self, update_id: u64, query: &str) {
+        let mut state = self.lock_state();
+        state.depth += 1;
+        state.peak_depth = state.peak_depth.max(state.depth);
+        state.latest_update_id = update_id;
+        state.latest_query.clear();
+        state.latest_query.push_str(query);
+    }
+
+    #[doc(hidden)]
+    pub fn record_resolved(&self, enqueued_at: Instant) {
+        let mut state = self.lock_state();
+        state.depth = state.depth.saturating_sub(1);
+        let age_ns = enqueued_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        state.ages_ns.push(age_ns);
+    }
+
+    fn record_send_failed(&self) {
+        let mut state = self.lock_state();
+        state.depth = state.depth.saturating_sub(1);
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, BenchQueueMetricsState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 struct SessionInner {
     search_directories: Vec<PathBuf>,
     limit: usize,
@@ -352,10 +537,20 @@ struct SessionInner {
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
+    #[cfg(feature = "perfloop-bench")]
+    bench_queue_metrics: Option<Arc<BenchQueueMetrics>>,
+    #[cfg(feature = "perfloop-bench")]
+    next_update_id: AtomicU64,
 }
 
 enum WorkSignal {
-    QueryUpdated(String),
+    QueryUpdated {
+        query: String,
+        #[cfg(feature = "perfloop-bench")]
+        update_id: u64,
+        #[cfg(feature = "perfloop-bench")]
+        enqueued_at: Instant,
+    },
     NucleoNotify,
     WalkComplete,
     Shutdown,
@@ -492,6 +687,8 @@ fn matcher_worker(
     let shutdown_requested = || inner.shutdown.load(Ordering::Relaxed);
 
     let mut last_query = String::new();
+    #[cfg(feature = "perfloop-bench")]
+    let mut last_update_id = 0;
     let mut next_notify = never();
     let mut will_notify = false;
     let mut walk_complete = false;
@@ -503,7 +700,17 @@ fn matcher_worker(
                     break;
                 };
                 match signal {
-                    WorkSignal::QueryUpdated(query) => {
+                    WorkSignal::QueryUpdated {
+                        query,
+                        #[cfg(feature = "perfloop-bench")]
+                        update_id,
+                        #[cfg(feature = "perfloop-bench")]
+                        enqueued_at,
+                    } => {
+                        #[cfg(feature = "perfloop-bench")]
+                        if let Some(metrics) = &inner.bench_queue_metrics {
+                            metrics.record_resolved(enqueued_at);
+                        }
                         let append = query.starts_with(&last_query);
                         nucleo.pattern.reparse(
                             0,
@@ -513,6 +720,10 @@ fn matcher_worker(
                             append,
                         );
                         last_query = query;
+                        #[cfg(feature = "perfloop-bench")]
+                        {
+                            last_update_id = update_id;
+                        }
                         will_notify = true;
                         next_notify = after(Duration::from_millis(0));
                     }
@@ -580,6 +791,8 @@ fn matcher_worker(
                         total_match_count: snapshot.matched_item_count() as usize,
                         scanned_file_count: snapshot.item_count() as usize,
                         walk_complete,
+                        #[cfg(feature = "perfloop-bench")]
+                        update_id: last_update_id,
                     };
                     inner.reporter.on_update(&snapshot);
                 }
