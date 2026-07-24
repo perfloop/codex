@@ -97,15 +97,15 @@ impl Drop for Tui {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use super::clear_for_viewport_change;
-    use super::render_pet_image_with_recovery;
+    use super::render_ambient_pet_image_with_recovery;
+    use super::render_pet_picker_preview_image_with_recovery;
     use super::should_emit_notification;
     use crate::custom_terminal::Terminal as CustomTerminal;
     use crate::pets::AmbientPetDraw;
     use crate::pets::ImageProtocol;
-    use crate::pets::PetImageRenderError;
     use crate::pets::PetImageRenderState;
     use crate::test_backend::VT100Backend;
     use codex_config::types::NotificationCondition;
@@ -178,64 +178,138 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sixel_raw_write_recovery_clears_column_zero_for_blank_viewports() {
-        for (width, stale) in [(1, "X"), (12, "stale")] {
-            let backend = VT100Backend::new(width, 1);
-            let mut terminal =
-                CustomTerminal::with_options_and_cursor_position(backend, Position::ORIGIN)
-                    .expect("terminal");
-            terminal.set_viewport_area(Rect::new(0, 0, width, 1));
-            terminal
-                .draw(|frame| {
-                    let area = frame.area();
-                    frame
-                        .buffer_mut()
-                        .set_style(area, ratatui::style::Style::default());
-                })
-                .expect("initial blank frame");
+    fn test_terminal(width: u16) -> CustomTerminal<VT100Backend> {
+        let backend = VT100Backend::new(width, 1);
+        let mut terminal =
+            CustomTerminal::with_options_and_cursor_position(backend, Position::ORIGIN)
+                .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, 1));
+        terminal
+    }
 
-            let mut state = PetImageRenderState::default();
-            let request = AmbientPetDraw {
-                frame: PathBuf::new(),
-                protocol: ImageProtocol::Sixel,
-                x: 0,
-                y: 0,
-                clear_top_y: 0,
-                columns: 1,
-                rows: 1,
-                height_px: 1,
-                sixel_dir: PathBuf::new(),
-            };
-            render_pet_image_with_recovery(
-                &mut terminal,
-                &mut state,
-                Some(request),
-                |backend, _, _| -> Result<(), PetImageRenderError> {
-                    write!(backend, "\x1b[H{stale}").map_err(PetImageRenderError::Terminal)?;
-                    Ok(())
-                },
-            )
-            .expect("raw Sixel-style write");
-            terminal
-                .draw(|frame| {
-                    let area = frame.area();
-                    frame
-                        .buffer_mut()
-                        .set_style(area, ratatui::style::Style::default());
-                })
-                .expect("recovery blank frame");
+    fn draw_text(terminal: &mut CustomTerminal<VT100Backend>, text: &str) {
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let buffer = frame.buffer_mut();
+                buffer.set_style(area, ratatui::style::Style::default());
+                buffer.set_string(0, 0, text, ratatui::style::Style::default());
+            })
+            .expect("frame");
+    }
 
-            assert!(
-                !terminal
-                    .backend()
-                    .vt100()
-                    .screen()
-                    .contents()
-                    .contains(stale),
-                "stale column-zero content survived recovery at width {width}",
-            );
+    fn sixel_request(dir: &Path, width: u16, payload: &str) -> AmbientPetDraw {
+        let frame = dir.join("frame.png");
+        std::fs::write(&frame, b"png").expect("frame fixture");
+        let sixel_dir = dir.join("sixel");
+        std::fs::create_dir(&sixel_dir).expect("Sixel fixture directory");
+        std::fs::write(sixel_dir.join("frame_h1_v2.six"), payload).expect("Sixel fixture");
+        AmbientPetDraw {
+            frame,
+            protocol: ImageProtocol::Sixel,
+            x: 0,
+            y: 0,
+            clear_top_y: 0,
+            columns: width,
+            rows: 1,
+            height_px: 1,
+            sixel_dir,
         }
+    }
+
+    fn assert_sixel_draw_recovery(width: u16, stale: &str, picker_preview: bool) {
+        let mut terminal = test_terminal(width);
+        draw_text(&mut terminal, "");
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let request = sixel_request(dir.path(), width, stale);
+        let mut state = PetImageRenderState::default();
+        if picker_preview {
+            render_pet_picker_preview_image_with_recovery(&mut terminal, &mut state, Some(request))
+                .expect("picker Sixel draw");
+        } else {
+            render_ambient_pet_image_with_recovery(&mut terminal, &mut state, Some(request))
+                .expect("ambient Sixel draw");
+        }
+        draw_text(&mut terminal, "");
+
+        assert!(
+            !terminal
+                .backend()
+                .vt100()
+                .screen()
+                .contents()
+                .contains(stale),
+            "{stale:?} survived the {} Sixel recovery at width {width}",
+            if picker_preview { "picker" } else { "ambient" },
+        );
+    }
+
+    fn assert_sixel_clear_recovery(width: u16, payload: &str, expected: &str) {
+        let mut terminal = test_terminal(width);
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let request = sixel_request(dir.path(), width, payload);
+        let mut state = PetImageRenderState::default();
+        render_ambient_pet_image_with_recovery(&mut terminal, &mut state, Some(request))
+            .expect("ambient Sixel draw");
+        draw_text(&mut terminal, expected);
+        render_ambient_pet_image_with_recovery(&mut terminal, &mut state, /*request*/ None)
+            .expect("ambient Sixel clear");
+        draw_text(&mut terminal, expected);
+
+        assert!(
+            terminal
+                .backend()
+                .vt100()
+                .screen()
+                .contents()
+                .contains(expected),
+            "the Sixel clear did not restore {expected:?} at width {width}",
+        );
+    }
+
+    #[test]
+    fn sixel_image_route_recovery_clears_column_zero_after_raw_writes() {
+        for (width, stale, expected) in [(1, "X", "A"), (12, "stale", "normal")] {
+            assert_sixel_draw_recovery(width, stale, /*picker_preview*/ false);
+            assert_sixel_draw_recovery(width, stale, /*picker_preview*/ true);
+            assert_sixel_clear_recovery(width, stale, expected);
+        }
+    }
+
+    #[test]
+    fn sixel_asset_error_does_not_force_a_repaint() {
+        let mut terminal = test_terminal(12);
+        draw_text(&mut terminal, "");
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let request = AmbientPetDraw {
+            frame: dir.path().join("missing.png"),
+            protocol: ImageProtocol::Sixel,
+            x: 0,
+            y: 0,
+            clear_top_y: 0,
+            columns: 1,
+            rows: 1,
+            height_px: 1,
+            sixel_dir: dir.path().join("sixel"),
+        };
+        let mut state = PetImageRenderState::default();
+
+        let err = render_ambient_pet_image_with_recovery(&mut terminal, &mut state, Some(request))
+            .expect_err("missing Sixel asset should fail before output");
+        assert!(matches!(err, crate::pets::PetImageRenderError::Asset(_)));
+
+        // This direct write follows the failed asset lookup. It remains visible
+        // only when the failed route correctly left the retained buffer alone.
+        write!(terminal.backend_mut(), "\x1b[Hstale").expect("direct write");
+        draw_text(&mut terminal, "");
+        assert!(
+            terminal
+                .backend()
+                .vt100()
+                .screen()
+                .contents()
+                .contains("stale")
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -656,10 +730,38 @@ where
 {
     let needs_viewport_invalidation = state.needs_viewport_invalidation(request.as_ref());
     let result = render(terminal.backend_mut(), state, request);
-    if needs_viewport_invalidation {
+    if needs_viewport_invalidation
+        && !matches!(&result, Err(crate::pets::PetImageRenderError::Asset(_)))
+    {
         terminal.invalidate_viewport();
     }
     result
+}
+
+fn render_ambient_pet_image_with_recovery<B>(
+    terminal: &mut CustomTerminal<B>,
+    state: &mut crate::pets::PetImageRenderState,
+    request: Option<crate::pets::AmbientPetDraw>,
+) -> std::result::Result<(), crate::pets::PetImageRenderError>
+where
+    B: Backend + Write,
+{
+    render_pet_image_with_recovery(terminal, state, request, |writer, state, request| {
+        crate::pets::render_ambient_pet_image(writer, state, request)
+    })
+}
+
+fn render_pet_picker_preview_image_with_recovery<B>(
+    terminal: &mut CustomTerminal<B>,
+    state: &mut crate::pets::PetImageRenderState,
+    request: Option<crate::pets::AmbientPetDraw>,
+) -> std::result::Result<(), crate::pets::PetImageRenderError>
+where
+    B: Backend + Write,
+{
+    render_pet_image_with_recovery(terminal, state, request, |writer, state, request| {
+        crate::pets::render_pet_picker_preview_image(writer, state, request)
+    })
 }
 
 impl Tui {
@@ -1058,14 +1160,7 @@ impl Tui {
         let terminal = &mut self.terminal;
         let state = &mut self.ambient_pet_image_state;
         stdout().sync_update(|_| {
-            match render_pet_image_with_recovery(
-                terminal,
-                state,
-                request,
-                |writer, state, request| {
-                    crate::pets::render_ambient_pet_image(writer, state, request)
-                },
-            ) {
+            match render_ambient_pet_image_with_recovery(terminal, state, request) {
                 Ok(()) => Ok(Ok(())),
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
                 Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
@@ -1084,14 +1179,7 @@ impl Tui {
         let terminal = &mut self.terminal;
         let state = &mut self.pet_picker_preview_image_state;
         stdout().sync_update(|_| {
-            match render_pet_image_with_recovery(
-                terminal,
-                state,
-                request,
-                |writer, state, request| {
-                    crate::pets::render_pet_picker_preview_image(writer, state, request)
-                },
-            ) {
+            match render_pet_picker_preview_image_with_recovery(terminal, state, request) {
                 Ok(()) => Ok(Ok(())),
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
                 Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
@@ -1106,11 +1194,10 @@ impl Tui {
             return Err(crate::pets::PetImageRenderError::Terminal(err));
         }
 
-        render_pet_image_with_recovery(
+        render_ambient_pet_image_with_recovery(
             &mut self.terminal,
             &mut self.ambient_pet_image_state,
             /*request*/ None,
-            |writer, state, request| crate::pets::render_ambient_pet_image(writer, state, request),
         )
     }
 
