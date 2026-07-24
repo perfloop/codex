@@ -325,7 +325,7 @@ where
     /// of the screen.
     pub fn resize(&mut self, screen_size: Size) -> io::Result<()> {
         self.last_known_screen_size = screen_size;
-        self.force_full_clear = true;
+        self.invalidate_viewport();
         Ok(())
     }
 
@@ -334,7 +334,7 @@ where
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
-        self.force_full_clear = true;
+        self.invalidate_viewport();
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
@@ -1016,7 +1016,7 @@ mod tests {
             let area = frame.area();
             let buffer = frame.buffer_mut();
             buffer.set_style(area, Style::default());
-            buffer.set_string(0, 0, text, Style::default());
+            buffer.set_string(area.x, area.y, text, Style::default());
         })
     }
 
@@ -1227,6 +1227,32 @@ mod tests {
         assert!(
             !screen.contains("old tail"),
             "retry retained stale suffix: {screen:?}",
+        );
+    }
+
+    #[test]
+    fn viewport_relocation_repaints_unchanged_content() {
+        let mut terminal = Terminal::with_options_and_cursor_position(
+            BufferedBackend::new(/*width*/ 12, /*height*/ 2),
+            Position::ORIGIN,
+        )
+        .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
+        draw_text(&mut terminal, "new").expect("initial frame");
+
+        terminal.set_viewport_area(Rect::new(0, 1, 12, 1));
+        draw_text(&mut terminal, "new").expect("relocated frame");
+
+        assert_eq!(
+            terminal
+                .backend()
+                .parser
+                .screen()
+                .cell(/*row*/ 1, /*column*/ 0)
+                .expect("visible relocated cell")
+                .contents(),
+            "n",
+            "unchanged text was not repainted at the new viewport origin",
         );
     }
 
