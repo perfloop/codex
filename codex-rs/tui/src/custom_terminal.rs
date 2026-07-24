@@ -447,9 +447,8 @@ where
             }
         }
 
-        self.swap_buffers();
-
         Backend::flush(&mut self.backend)?;
+        self.swap_buffers();
         self.force_full_clear = false;
 
         Ok(())
@@ -584,10 +583,6 @@ enum DrawCommand {
 fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
-
-    if a.area.is_empty() {
-        return vec![];
-    }
 
     let mut last_nonblank_columns = vec![None; a.area.height as usize];
     for y in 0..a.area.height {
@@ -1016,6 +1011,15 @@ mod tests {
         })
     }
 
+    fn draw_text(terminal: &mut Terminal<BufferedBackend>, text: &str) -> io::Result<()> {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let buffer = frame.buffer_mut();
+            buffer.set_style(area, Style::default());
+            buffer.set_string(0, 0, text, Style::default());
+        })
+    }
+
     #[test]
     fn diff_buffers_does_not_emit_clear_to_end_for_full_width_row() {
         let area = Rect::new(0, 0, 3, 2);
@@ -1193,6 +1197,37 @@ mod tests {
                 terminal.backend().parser.screen().contents(),
             );
         }
+    }
+
+    #[test]
+    fn failed_backend_flush_retries_forced_populated_frame() {
+        let mut terminal = Terminal::with_options_and_cursor_position(
+            BufferedBackend::new(/*width*/ 12, /*height*/ 1),
+            Position::ORIGIN,
+        )
+        .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
+        draw_blank(&mut terminal).expect("initial blank draw");
+
+        terminal
+            .backend_mut()
+            .write_all(b"\x1b[Hold tail")
+            .expect("buffer direct stale text");
+        Backend::flush(terminal.backend_mut()).expect("publish direct stale text");
+        terminal.invalidate_viewport();
+        terminal.backend_mut().fail_next_flush = true;
+
+        assert!(draw_text(&mut terminal, "new").is_err());
+        draw_text(&mut terminal, "new").expect("retry populated frame");
+        let screen = terminal.backend().parser.screen().contents();
+        assert!(
+            screen.contains("new"),
+            "retry omitted replacement: {screen:?}"
+        );
+        assert!(
+            !screen.contains("old tail"),
+            "retry retained stale suffix: {screen:?}",
+        );
     }
 
     #[test]
