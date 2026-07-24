@@ -1,13 +1,23 @@
-//! Measurement-only driver for the custom terminal's per-frame output.
+//! A focused, in-memory measurement of `custom_terminal` frame output.
 //!
-//! It runs the public `Terminal::draw` path against an in-memory ANSI terminal so
-//! the sample includes `flush`, `diff_buffers`, `draw`, and backend flushing.
+//! The driver imports the production source directly, then exercises
+//! `Terminal::draw -> flush -> diff_buffers -> draw` through a VT100 parser.
 
 use std::env;
 use std::hint::black_box;
 use std::io;
 use std::io::Write;
 use std::mem;
+
+// `custom_terminal` only uses this warning on the constructor path that probes
+// a real terminal. The driver supplies a cursor position, so a no-op shim keeps
+// the measured source and its dependencies focused on the terminal path.
+mod tracing {
+    macro_rules! warn {
+        ($($tokens:tt)*) => {};
+    }
+    pub(crate) use warn;
+}
 
 #[path = "../../../src/custom_terminal.rs"]
 mod custom_terminal;
@@ -16,6 +26,7 @@ use custom_terminal::Terminal;
 use ratatui::backend::Backend;
 use ratatui::backend::ClearType;
 use ratatui::backend::WindowSize;
+use ratatui::buffer::Buffer;
 use ratatui::buffer::Cell;
 use ratatui::layout::Position;
 use ratatui::layout::Rect;
@@ -44,20 +55,16 @@ impl CaptureBackend {
         }
     }
 
-    fn preload(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-    }
-
     fn take_output(&mut self) -> Vec<u8> {
         mem::take(&mut self.output)
     }
 }
 
 impl Write for CaptureBackend {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.output.extend_from_slice(buf);
-        self.parser.process(buf);
-        Ok(buf.len())
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.output.extend_from_slice(bytes);
+        self.parser.process(bytes);
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -134,102 +141,62 @@ impl Backend for CaptureBackend {
     }
 }
 
-fn terminal(backend: CaptureBackend) -> Terminal<CaptureBackend> {
-    let size = backend.size;
+fn terminal(width: u16, height: u16) -> Terminal<CaptureBackend> {
+    let backend = CaptureBackend::new(width, height);
     let mut terminal = Terminal::with_options_and_cursor_position(backend, Position { x: 0, y: 0 })
-        .expect("capture backend should construct a terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, size.width, size.height));
+        .expect("capture terminal should initialize");
+    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
 }
 
-fn draw_sparse_frame(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
+fn render(terminal: &mut Terminal<CaptureBackend>, draw: impl FnOnce(&mut Buffer, Rect)) {
     terminal
         .draw(|frame| {
             let area = frame.area();
-            let buffer = frame.buffer_mut();
-            buffer.set_style(area, Style::default());
+            draw(frame.buffer_mut(), area);
+        })
+        .expect("frame should draw");
+}
+
+fn sparse(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
+    render(terminal, |buffer, area| {
+        buffer.set_style(area, Style::default());
+        buffer.set_string(
+            0,
+            0,
+            format!("stream tick {tick}"),
+            Style::default().fg(Color::Cyan),
+        );
+        for y in (4..area.height).step_by(8) {
             buffer.set_string(
                 0,
-                0,
-                format!("stream tick {tick}"),
-                Style::default().fg(Color::Cyan),
+                y,
+                "waiting for activity",
+                Style::default().fg(Color::DarkGray),
             );
-            for y in (4..area.height).step_by(8) {
-                buffer.set_string(
-                    0,
-                    y,
-                    "waiting for activity",
-                    Style::default().fg(Color::DarkGray),
-                );
-            }
-        })
-        .expect("sparse frame should draw");
+        }
+    });
 }
 
-fn draw_frame_with_tail_content(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            let buffer = frame.buffer_mut();
-            buffer.set_style(area, Style::default());
+fn tail_content(terminal: &mut Terminal<CaptureBackend>, tick: u64) {
+    render(terminal, |buffer, area| {
+        buffer.set_style(area, Style::default());
+        buffer.set_string(0, 0, format!("stream tick {tick}"), Style::default());
+        for y in 0..area.height {
             buffer.set_string(
-                0,
-                0,
-                format!("stream tick {tick}"),
-                Style::default().fg(Color::Cyan),
+                area.width.saturating_sub(9),
+                y,
+                "old tail",
+                Style::default().fg(Color::Yellow),
             );
-            for y in 0..area.height {
-                buffer.set_string(
-                    area.width.saturating_sub(9),
-                    y,
-                    "old tail",
-                    Style::default().fg(Color::Yellow),
-                );
-            }
-        })
-        .expect("tail-content frame should draw");
+        }
+    });
 }
 
-fn draw_empty_frame(terminal: &mut Terminal<CaptureBackend>) {
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            frame.buffer_mut().set_style(area, Style::default());
-        })
-        .expect("empty frame should draw");
-}
-
-fn draw_background_frame(terminal: &mut Terminal<CaptureBackend>, color: Color) {
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            frame
-                .buffer_mut()
-                .set_style(area, Style::default().bg(color));
-        })
-        .expect("background frame should draw");
-}
-
-fn draw_text_frame(terminal: &mut Terminal<CaptureBackend>, text: &str) {
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            let buffer = frame.buffer_mut();
-            buffer.set_style(area, Style::default());
-            buffer.set_string(0, 0, text, Style::default());
-        })
-        .expect("text frame should draw");
-}
-
-fn draw_underlined_blanks(terminal: &mut Terminal<CaptureBackend>) {
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            frame
-                .buffer_mut()
-                .set_style(area, Style::default().add_modifier(Modifier::UNDERLINED));
-        })
-        .expect("underlined frame should draw");
+fn empty(terminal: &mut Terminal<CaptureBackend>) {
+    render(terminal, |buffer, area| {
+        buffer.set_style(area, Style::default())
+    });
 }
 
 fn clear_to_end_count(bytes: &[u8]) -> usize {
@@ -239,120 +206,112 @@ fn clear_to_end_count(bytes: &[u8]) -> usize {
         .count()
 }
 
-fn sparse_one_row_change_sample(tick: u64) {
-    let mut terminal = terminal(CaptureBackend::new(WIDTH, HEIGHT));
-    draw_sparse_frame(&mut terminal, tick.saturating_sub(1));
+#[allow(clippy::print_stdout)]
+fn sample(tick: u64, tail_changes: bool) {
+    let mut terminal = terminal(WIDTH, HEIGHT);
+    if tail_changes {
+        tail_content(&mut terminal, tick.saturating_sub(1));
+    } else {
+        sparse(&mut terminal, tick.saturating_sub(1));
+    }
     terminal.backend_mut().take_output();
+    sparse(&mut terminal, tick);
 
-    draw_sparse_frame(&mut terminal, tick);
     let output = terminal.backend_mut().take_output();
     let bytes = black_box(output.len());
-    let clear_commands = black_box(clear_to_end_count(&output));
-
-    println!(
-        "{{\"metric\":\"terminal_output_bytes_per_sparse_one_row_change\",\"value\":{bytes}}}"
-    );
-    println!(
-        "{{\"metric\":\"clear_to_end_commands_per_sparse_one_row_change\",\"value\":{clear_commands}}}"
-    );
+    let clears = black_box(clear_to_end_count(&output));
+    let (bytes_metric, clears_metric) = if tail_changes {
+        (
+            "terminal_output_bytes_per_tail_change",
+            "clear_to_end_commands_per_tail_change",
+        )
+    } else {
+        (
+            "terminal_output_bytes_per_sparse_one_row_change",
+            "clear_to_end_commands_per_sparse_one_row_change",
+        )
+    };
+    println!("{{\"metric\":\"{bytes_metric}\",\"value\":{bytes}}}");
+    println!("{{\"metric\":\"{clears_metric}\",\"value\":{clears}}}");
 }
 
-fn tail_change_sample(tick: u64) {
-    let mut terminal = terminal(CaptureBackend::new(WIDTH, HEIGHT));
-    draw_frame_with_tail_content(&mut terminal, tick.saturating_sub(1));
-    terminal.backend_mut().take_output();
-
-    draw_sparse_frame(&mut terminal, tick);
-    let output = terminal.backend_mut().take_output();
-    let bytes = black_box(output.len());
-    let clear_commands = black_box(clear_to_end_count(&output));
-
-    println!("{{\"metric\":\"terminal_output_bytes_per_tail_change\",\"value\":{bytes}}}");
-    println!("{{\"metric\":\"clear_to_end_commands_per_tail_change\",\"value\":{clear_commands}}}");
-}
-
-fn verify_visual_differential() {
-    let mut stale_backend = CaptureBackend::new(12, 1);
-    stale_backend.preload(b"\x1b[H    stale");
-    let mut stale_terminal = terminal(stale_backend);
-    draw_empty_frame(&mut stale_terminal);
+fn verify() {
+    let mut stale = CaptureBackend::new(12, 1);
+    stale.parser.process(b"\x1b[H    stale");
+    let mut terminal = Terminal::with_options_and_cursor_position(stale, Position { x: 0, y: 0 })
+        .expect("capture terminal should initialize");
+    terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
+    empty(&mut terminal);
     assert!(
-        !stale_terminal
+        !terminal
             .backend()
             .parser
             .screen()
             .contents()
-            .contains("stale"),
-        "an initial frame must erase stale tail text"
+            .contains("stale")
     );
 
-    let mut wide_terminal = terminal(CaptureBackend::new(12, 1));
-    draw_text_frame(&mut wide_terminal, "中文");
-    wide_terminal.backend_mut().take_output();
-    draw_text_frame(&mut wide_terminal, "中");
-    let wide_contents = wide_terminal.backend().parser.screen().contents();
-    assert!(
-        wide_contents.contains('中'),
-        "remaining wide glyph was lost"
-    );
-    assert!(
-        !wide_contents.contains('文'),
-        "removed wide glyph remains visible: {wide_contents:?}"
-    );
+    let mut wide = terminal(12, 1);
+    render(&mut wide, |buffer, area| {
+        buffer.set_style(area, Style::default());
+        buffer.set_string(0, 0, "中文", Style::default());
+    });
+    wide.backend_mut().take_output();
+    render(&mut wide, |buffer, area| {
+        buffer.set_style(area, Style::default());
+        buffer.set_string(0, 0, "中", Style::default());
+    });
+    let screen = wide.backend().parser.screen().contents();
+    assert!(screen.contains('中') && !screen.contains('文'));
 
-    let mut background_terminal = terminal(CaptureBackend::new(10, 1));
-    draw_background_frame(&mut background_terminal, Color::Blue);
-    let before_background = format!(
+    let mut colors = terminal(10, 1);
+    render(&mut colors, |buffer, area| {
+        buffer.set_style(area, Style::default().bg(Color::Blue));
+    });
+    let blue = format!(
         "{:?}",
-        background_terminal
+        colors
             .backend()
             .parser
             .screen()
             .cell(0, 8)
-            .expect("background cell should exist")
+            .unwrap()
             .bgcolor()
     );
-    background_terminal.backend_mut().take_output();
-    draw_background_frame(&mut background_terminal, Color::Red);
-    let after_background = format!(
+    colors.backend_mut().take_output();
+    render(&mut colors, |buffer, area| {
+        buffer.set_style(area, Style::default().bg(Color::Red));
+    });
+    let red = format!(
         "{:?}",
-        background_terminal
+        colors
             .backend()
             .parser
             .screen()
             .cell(0, 8)
-            .expect("background cell should exist")
+            .unwrap()
             .bgcolor()
     );
-    assert_ne!(
-        before_background, after_background,
-        "tail background did not update"
-    );
-    assert_ne!(after_background, "Default", "tail background was reset");
+    assert_ne!(blue, red);
+    assert_ne!(red, "Default");
 
-    let mut modifier_terminal = terminal(CaptureBackend::new(10, 1));
-    draw_underlined_blanks(&mut modifier_terminal);
-    modifier_terminal.backend_mut().take_output();
-    draw_empty_frame(&mut modifier_terminal);
-    let modifier_output = modifier_terminal.backend_mut().take_output();
-    assert!(
-        clear_to_end_count(&modifier_output) > 0,
-        "a modifier-only tail must be cleared"
-    );
+    let mut modifiers = terminal(10, 1);
+    render(&mut modifiers, |buffer, area| {
+        buffer.set_style(area, Style::default().add_modifier(Modifier::UNDERLINED));
+    });
+    modifiers.backend_mut().take_output();
+    empty(&mut modifiers);
+    assert!(clear_to_end_count(&modifiers.backend_mut().take_output()) > 0);
 
-    let mut static_terminal = terminal(CaptureBackend::new(WIDTH, HEIGHT));
-    draw_sparse_frame(&mut static_terminal, 17);
-    let before = static_terminal.backend().parser.screen().contents();
-    static_terminal.backend_mut().take_output();
-    draw_sparse_frame(&mut static_terminal, 17);
-    let after = static_terminal.backend().parser.screen().contents();
-    assert_eq!(
-        before, after,
-        "an unchanged frame changed the visible screen"
-    );
+    let mut unchanged = terminal(WIDTH, HEIGHT);
+    sparse(&mut unchanged, 17);
+    let before = unchanged.backend().parser.screen().contents();
+    unchanged.backend_mut().take_output();
+    sparse(&mut unchanged, 17);
+    assert_eq!(before, unchanged.backend().parser.screen().contents());
 }
 
-fn parse_tick() -> u64 {
+fn tick() -> u64 {
     env::args()
         .nth(2)
         .expect("a runtime tick argument is required")
@@ -363,10 +322,10 @@ fn parse_tick() -> u64 {
 #[allow(clippy::print_stderr, clippy::print_stdout)]
 fn main() {
     match env::args().nth(1).as_deref() {
-        Some("sparse-one-row-change") => sparse_one_row_change_sample(parse_tick()),
-        Some("tail-change") => tail_change_sample(parse_tick()),
+        Some("sparse-one-row-change") => sample(tick(), false),
+        Some("tail-change") => sample(tick(), true),
         Some("verify") => {
-            verify_visual_differential();
+            verify();
             println!("custom-terminal visual verification passed");
         }
         _ => {
