@@ -451,6 +451,8 @@ struct BenchQueueMetricsState {
     // implementation should keep this depth bounded even while logical updates arrive.
     depth: usize,
     peak_depth: usize,
+    enqueued_depth_sum: u128,
+    enqueued_depth_count: usize,
     ages_ns: Vec<u64>,
     // These describe logical update_query calls independently of physical signals.
     logical_update_count: usize,
@@ -464,6 +466,7 @@ struct BenchQueueMetricsState {
 #[doc(hidden)]
 pub struct BenchQueueStats {
     pub peak_depth: usize,
+    pub enqueued_mean_depth_milli: u64,
     pub p99_age_ns: u64,
     pub resolved_query_count: usize,
     pub logical_update_count: usize,
@@ -488,6 +491,12 @@ impl BenchQueueMetrics {
         let state = self.lock_state();
         let mut ages_ns = state.ages_ns.clone();
         let peak_depth = state.peak_depth;
+        let enqueued_mean_depth_milli = if state.enqueued_depth_count == 0 {
+            0
+        } else {
+            (state.enqueued_depth_sum.saturating_mul(1_000) / state.enqueued_depth_count as u128)
+                .min(u128::from(u64::MAX)) as u64
+        };
         let logical_update_count = state.logical_update_count;
         let completion_count = state.completion_count;
         drop(state);
@@ -505,6 +514,7 @@ impl BenchQueueMetrics {
             .unwrap_or_default();
         BenchQueueStats {
             peak_depth,
+            enqueued_mean_depth_milli,
             p99_age_ns,
             resolved_query_count: ages_ns.len(),
             logical_update_count,
@@ -526,6 +536,8 @@ impl BenchQueueMetrics {
         let mut state = self.lock_state();
         state.depth += 1;
         state.peak_depth = state.peak_depth.max(state.depth);
+        state.enqueued_depth_sum = state.enqueued_depth_sum.saturating_add(state.depth as u128);
+        state.enqueued_depth_count += 1;
     }
 
     #[doc(hidden)]
