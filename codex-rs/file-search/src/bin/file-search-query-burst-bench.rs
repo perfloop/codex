@@ -23,7 +23,7 @@ const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
 // Averaging independent identity-checked bursts makes one proof sample stable
 // without hiding an individual burst behind an unobserved batch runner.
-const BURSTS_PER_SAMPLE: usize = 16;
+const BURSTS_PER_SAMPLE: usize = 48;
 // PasteBurst treats an 8-ms-or-shorter plain-character interval as a paste. The
 // TUI's own human-input helper sleeps its recommended 8-ms-plus-1-ms delay and
 // flushes after every character, so this is the source-backed non-burst cadence.
