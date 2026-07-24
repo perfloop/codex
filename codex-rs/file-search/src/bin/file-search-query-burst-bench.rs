@@ -21,12 +21,9 @@ use std::time::Instant;
 
 const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
-// One sample averages repeated identity-checked typed bursts before emitting
-// the supporting newest-query callback-latency observation.
+// Average repeated identity-checked typed bursts per proof sample.
 const BURSTS_PER_SAMPLE: usize = 48;
-// PasteBurst treats an 8-ms-or-shorter plain-character interval as a paste. The
-// TUI's own human-input helper sleeps its recommended 8-ms-plus-1-ms delay and
-// flushes after every character, so this is the source-backed non-burst cadence.
+// 9 ms is the TUI PasteBurst source-backed non-burst cadence.
 const TYPED_CHAR_CADENCE: Duration = Duration::from_millis(9);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_QUERY: &str = "zz";
@@ -60,9 +57,7 @@ fn run() -> anyhow::Result<()> {
         None,
     )?;
 
-    // Let the walker and matcher reach an idle, fully populated state before the
-    // typed-query control begins. This keeps the measured burst focused on
-    // superseded query work rather than initial discovery.
+    // Exclude initial discovery from the steady-state typed-query measurement.
     reporter.wait_for_initial_completion(CALLBACK_TIMEOUT)?;
     let warmup_sent_at = Instant::now();
     let warmup_id = session.update_query_with_id(WARMUP_QUERY);
@@ -185,12 +180,8 @@ fn run_typed_query_burst(
         .min(u128::from(u64::MAX)) as u64)
 }
 
-// These are exactly the distinct `@`-token values produced by ordinary
-// typing at a cursor immediately before an existing `zz` suffix: `azz`,
-// `abzz`, ... . They deliberately are not append-only matcher inputs, which
-// exercises the edit path rather than an incremental append fast path. Every
-// generic fixture path contains the final value, so each query still exercises
-// the broad 8,192-file matcher workload.
+// Distinct cursor-before-suffix @ tokens avoid the append fast path; every
+// generic fixture path contains the final value for a broad matcher workload.
 fn typed_query_tokens() -> Vec<String> {
     let mut prefix = String::new();
     (0..UPDATE_COUNT)

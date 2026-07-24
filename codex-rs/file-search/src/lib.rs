@@ -175,9 +175,7 @@ impl FileSearchSession {
             .wrapping_add(1);
         let enqueued_at = Instant::now();
         if let Some(metrics) = &self.inner.bench_queue_metrics {
-            // Logical submissions and physical work signals intentionally differ once a
-            // latest-value implementation coalesces superseded queries. Keep both counts
-            // so the benchmark can report queue depth/age without requiring stale work.
+            // Coalescing may make logical submissions outnumber physical signals.
             metrics.record_submitted(update_id, pattern_text);
             metrics.record_enqueued();
         }
@@ -447,14 +445,13 @@ pub struct BenchQueueMetrics {
 #[cfg(feature = "perfloop-bench")]
 #[derive(Default)]
 struct BenchQueueMetricsState {
-    // These describe physical query signals in the worker queue. A coalescing
-    // implementation should keep this depth bounded even while logical updates arrive.
+    // Physical query signals in the worker queue.
     depth: usize,
     peak_depth: usize,
     enqueued_depth_sum: u128,
     enqueued_depth_count: usize,
     ages_ns: Vec<u64>,
-    // These describe logical update_query calls independently of physical signals.
+    // Logical update_query calls.
     logical_update_count: usize,
     latest_update_id: u64,
     latest_query: String,

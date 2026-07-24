@@ -25,9 +25,7 @@ fn new_composer() -> (ChatComposer, UnboundedReceiver<AppEvent>) {
     )
 }
 
-// ChatComposer can synchronize a popup more than once for one input event.
-// FileSearchManager only forwards a changed nonempty query to the session, so
-// apply that same retained-query boundary before asserting downstream arrivals.
+// Mirror FileSearchManager's changed, nonempty query filter.
 fn file_search_manager_queries(receiver: &mut UnboundedReceiver<AppEvent>) -> Vec<String> {
     let mut queries = Vec::new();
     let mut last_query = None;
@@ -47,9 +45,7 @@ fn file_search_manager_queries(receiver: &mut UnboundedReceiver<AppEvent>) -> Ve
 
 #[test]
 fn file_search_emission_uses_each_non_burst_prefix_and_one_burst_result() {
-    // This is the same control used by the benchmark: each plain character is
-    // followed by the TUI's recommended PasteBurst flush delay, so it remains
-    // ordinary typing rather than a buffered paste.
+    // Delay past PasteBurst's threshold so each changed token is forwarded.
     let (mut typed_composer, mut typed_events) = new_composer();
     for ch in ['@', 'z', 'z'] {
         let _ =
@@ -60,9 +56,7 @@ fn file_search_emission_uses_each_non_burst_prefix_and_one_burst_result() {
             "expected the non-burst character {ch:?} to flush"
         );
     }
-    // Move immediately after the @ sigil, then type a prefix before the
-    // existing suffix. This is a normal cursor edit whose query values are not
-    // append-only from the matcher's perspective.
+    // Cursor-before-suffix edits are non-append matcher inputs.
     for _ in 0..2 {
         let _ = typed_composer.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
     }
@@ -81,9 +75,7 @@ fn file_search_emission_uses_each_non_burst_prefix_and_one_burst_result() {
         "each changed non-burst @ token must reach the file-search event path"
     );
 
-    // In contrast, a 1-ms character stream remains buffered until one paste
-    // flush, so it may publish only the final query rather than a query per
-    // character. The benchmark must not manufacture this input regime.
+    // A 1-ms paste-like stream publishes only its final token.
     let (mut burst_composer, mut burst_events) = new_composer();
     let mut now = Instant::now();
     for ch in ['@', 'z', 'a', 'b'] {
@@ -91,8 +83,6 @@ fn file_search_emission_uses_each_non_burst_prefix_and_one_burst_result() {
             KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
             now,
         );
-        // handle_key_event performs this after input dispatch; use the same
-        // synchronization point while injecting deterministic test times.
         burst_composer.sync_popups();
         now += Duration::from_millis(1);
     }

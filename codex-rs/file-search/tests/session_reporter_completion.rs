@@ -29,9 +29,7 @@ struct RecordingReporter {
 }
 
 impl RecordingReporter {
-    // Completion is the public synchronization signal. Deliberately use the
-    // same unbounded condition-variable wait as RunReporter rather than a
-    // scheduler-dependent deadline: failure to signal is the contract failure.
+    // Match RunReporter's condition-variable completion contract.
     fn wait_for_initial_completion(&self) {
         let mut state = self.lock_state();
         while state.completion_count == 0 {
