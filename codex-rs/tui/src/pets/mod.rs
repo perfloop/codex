@@ -119,6 +119,20 @@ pub(crate) struct PetImageRenderState {
     last_protocol: Option<image_protocol::ImageProtocol>,
 }
 
+impl PetImageRenderState {
+    /// Whether this render can directly replace terminal text cells outside the
+    /// ratatui buffer.
+    ///
+    /// Kitty operations save and restore the cursor around image protocol data,
+    /// while Sixel redraw and cleanup explicitly write blank text cells.
+    pub(crate) fn needs_viewport_invalidation(&self, request: Option<&AmbientPetDraw>) -> bool {
+        self.last_sixel_clear_area.is_some()
+            || request.is_some_and(|request| {
+                matches!(request.protocol, image_protocol::ImageProtocol::Sixel)
+            })
+    }
+}
+
 fn render_pet_image(
     writer: &mut impl Write,
     state: &mut PetImageRenderState,
@@ -349,6 +363,49 @@ mod tests {
     }
 
     #[test]
+    fn only_sixel_cell_operations_require_viewport_invalidation() {
+        let kitty_request = AmbientPetDraw {
+            frame: PathBuf::new(),
+            protocol: ImageProtocol::Kitty,
+            x: 0,
+            y: 0,
+            clear_top_y: 0,
+            columns: 1,
+            rows: 1,
+            height_px: 1,
+            sixel_dir: PathBuf::new(),
+        };
+        let sixel_request = AmbientPetDraw {
+            frame: PathBuf::new(),
+            protocol: ImageProtocol::Sixel,
+            x: 0,
+            y: 0,
+            clear_top_y: 0,
+            columns: 1,
+            rows: 1,
+            height_px: 1,
+            sixel_dir: PathBuf::new(),
+        };
+        let state = PetImageRenderState::default();
+
+        assert!(!state.needs_viewport_invalidation(Some(&kitty_request)));
+        assert!(state.needs_viewport_invalidation(Some(&sixel_request)));
+        assert!(!state.needs_viewport_invalidation(None));
+
+        let state = PetImageRenderState {
+            last_sixel_clear_area: Some(SixelClearArea {
+                x: 0,
+                clear_top_y: 0,
+                clear_bottom_y: 1,
+                columns: 1,
+            }),
+            ..Default::default()
+        };
+        assert!(state.needs_viewport_invalidation(Some(&kitty_request)));
+        assert!(state.needs_viewport_invalidation(None));
+    }
+
+    #[test]
     fn sixel_pet_image_clears_cell_area_before_redrawing() {
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("frame.png");
@@ -403,8 +460,10 @@ mod tests {
         let mut state = PetImageRenderState::default();
 
         render_ambient_pet_image(&mut output, &mut state, Some(request)).unwrap();
+        assert!(state.needs_viewport_invalidation(None));
         output.clear();
         render_ambient_pet_image(&mut output, &mut state, /*request*/ None).unwrap();
+        assert!(!state.needs_viewport_invalidation(None));
 
         let output = String::from_utf8(output).unwrap();
         assert!(!output.contains("Ga=d,d=I,i=49374,q=2;"));

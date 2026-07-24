@@ -97,10 +97,16 @@ impl Drop for Tui {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::path::PathBuf;
 
     use super::clear_for_viewport_change;
+    use super::render_pet_image_with_recovery;
     use super::should_emit_notification;
     use crate::custom_terminal::Terminal as CustomTerminal;
+    use crate::pets::AmbientPetDraw;
+    use crate::pets::ImageProtocol;
+    use crate::pets::PetImageRenderError;
+    use crate::pets::PetImageRenderState;
     use crate::test_backend::VT100Backend;
     use codex_config::types::NotificationCondition;
     use ratatui::layout::Position;
@@ -170,6 +176,66 @@ mod tests {
             !rows.iter().skip(1).any(|row| row.contains("stale")),
             "expected stale cells inside the new viewport to be cleared, rows: {rows:?}"
         );
+    }
+
+    #[test]
+    fn sixel_raw_write_recovery_clears_column_zero_for_blank_viewports() {
+        for (width, stale) in [(1, "X"), (12, "stale")] {
+            let backend = VT100Backend::new(width, 1);
+            let mut terminal =
+                CustomTerminal::with_options_and_cursor_position(backend, Position::ORIGIN)
+                    .expect("terminal");
+            terminal.set_viewport_area(Rect::new(0, 0, width, 1));
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame
+                        .buffer_mut()
+                        .set_style(area, ratatui::style::Style::default());
+                })
+                .expect("initial blank frame");
+
+            let mut state = PetImageRenderState::default();
+            let request = AmbientPetDraw {
+                frame: PathBuf::new(),
+                protocol: ImageProtocol::Sixel,
+                x: 0,
+                y: 0,
+                clear_top_y: 0,
+                columns: 1,
+                rows: 1,
+                height_px: 1,
+                sixel_dir: PathBuf::new(),
+            };
+            render_pet_image_with_recovery(
+                &mut terminal,
+                &mut state,
+                Some(request),
+                |backend, _, _| -> Result<(), PetImageRenderError> {
+                    write!(backend, "\x1b[H{stale}").map_err(PetImageRenderError::Terminal)?;
+                    Ok(())
+                },
+            )
+            .expect("raw Sixel-style write");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame
+                        .buffer_mut()
+                        .set_style(area, ratatui::style::Style::default());
+                })
+                .expect("recovery blank frame");
+
+            assert!(
+                !terminal
+                    .backend()
+                    .vt100()
+                    .screen()
+                    .contents()
+                    .contains(stale),
+                "stale column-zero content survived recovery at width {width}",
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -565,6 +631,35 @@ where
         terminal.viewport_area.as_position()
     };
     terminal.clear_after_position(clear_position)
+}
+
+/// Runs an image protocol write and restores buffer ownership when that write
+/// can have changed terminal text cells.
+///
+/// The ambient, picker-preview, and ambient-clear routes all use this handoff.
+/// `PetImageRenderState` distinguishes Sixel's direct blank-cell writes from
+/// Kitty protocol output, which saves and restores the cursor without changing
+/// ratatui-owned cells.
+fn render_pet_image_with_recovery<B, F>(
+    terminal: &mut CustomTerminal<B>,
+    state: &mut crate::pets::PetImageRenderState,
+    request: Option<crate::pets::AmbientPetDraw>,
+    render: F,
+) -> std::result::Result<(), crate::pets::PetImageRenderError>
+where
+    B: Backend + Write,
+    F: FnOnce(
+        &mut B,
+        &mut crate::pets::PetImageRenderState,
+        Option<crate::pets::AmbientPetDraw>,
+    ) -> std::result::Result<(), crate::pets::PetImageRenderError>,
+{
+    let needs_viewport_invalidation = state.needs_viewport_invalidation(request.as_ref());
+    let result = render(terminal.backend_mut(), state, request);
+    if needs_viewport_invalidation {
+        terminal.invalidate_viewport();
+    }
+    result
 }
 
 impl Tui {
@@ -963,7 +1058,14 @@ impl Tui {
         let terminal = &mut self.terminal;
         let state = &mut self.ambient_pet_image_state;
         stdout().sync_update(|_| {
-            match crate::pets::render_ambient_pet_image(terminal.backend_mut(), state, request) {
+            match render_pet_image_with_recovery(
+                terminal,
+                state,
+                request,
+                |writer, state, request| {
+                    crate::pets::render_ambient_pet_image(writer, state, request)
+                },
+            ) {
                 Ok(()) => Ok(Ok(())),
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
                 Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
@@ -982,10 +1084,13 @@ impl Tui {
         let terminal = &mut self.terminal;
         let state = &mut self.pet_picker_preview_image_state;
         stdout().sync_update(|_| {
-            match crate::pets::render_pet_picker_preview_image(
-                terminal.backend_mut(),
+            match render_pet_image_with_recovery(
+                terminal,
                 state,
                 request,
+                |writer, state, request| {
+                    crate::pets::render_pet_picker_preview_image(writer, state, request)
+                },
             ) {
                 Ok(()) => Ok(Ok(())),
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
@@ -1001,10 +1106,11 @@ impl Tui {
             return Err(crate::pets::PetImageRenderError::Terminal(err));
         }
 
-        crate::pets::render_ambient_pet_image(
-            self.terminal.backend_mut(),
+        render_pet_image_with_recovery(
+            &mut self.terminal,
             &mut self.ambient_pet_image_state,
             /*request*/ None,
+            |writer, state, request| crate::pets::render_ambient_pet_image(writer, state, request),
         )
     }
 
