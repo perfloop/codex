@@ -12,12 +12,11 @@ use std::mem;
 // `custom_terminal` only uses this warning on the constructor path that probes
 // a real terminal. The driver supplies a cursor position, so a no-op shim keeps
 // the measured source and its dependencies focused on the terminal path.
-mod tracing {
-    macro_rules! warn {
-        ($($tokens:tt)*) => {};
-    }
-    pub(crate) use warn;
+#[macro_export]
+macro_rules! warn {
+    ($($tokens:tt)*) => {};
 }
+extern crate self as tracing;
 
 #[path = "../../../src/custom_terminal.rs"]
 mod custom_terminal;
@@ -238,12 +237,13 @@ fn sample(tick: u64, tail_changes: bool) {
 fn verify() {
     let mut stale = CaptureBackend::new(12, 1);
     stale.parser.process(b"\x1b[H    stale");
-    let mut terminal = Terminal::with_options_and_cursor_position(stale, Position { x: 0, y: 0 })
-        .expect("capture terminal should initialize");
-    terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
-    empty(&mut terminal);
+    let mut stale_terminal =
+        Terminal::with_options_and_cursor_position(stale, Position { x: 0, y: 0 })
+            .expect("capture terminal should initialize");
+    stale_terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
+    empty(&mut stale_terminal);
     assert!(
-        !terminal
+        !stale_terminal
             .backend()
             .parser
             .screen()
