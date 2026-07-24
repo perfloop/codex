@@ -4794,6 +4794,10 @@ impl ChatComposer {
 mod effort_tests;
 
 #[cfg(test)]
+#[path = "chat_composer_file_search_tests.rs"]
+mod file_search_tests;
+
+#[cfg(test)]
 mod tests {
     use super::attachment_state::AttachedImage;
     use super::*;

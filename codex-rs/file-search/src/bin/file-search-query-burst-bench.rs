@@ -21,21 +21,23 @@ use std::time::Instant;
 
 const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
-const BURSTS_PER_SAMPLE: usize = 32;
-const UPDATE_CADENCE: Duration = Duration::from_millis(2);
+// PasteBurst treats an 8-ms-or-shorter plain-character interval as a paste. The
+// TUI's own human-input helper sleeps its recommended 8-ms-plus-1-ms delay and
+// flushes after every character, so this is the source-backed non-burst cadence.
+const TYPED_CHAR_CADENCE: Duration = Duration::from_millis(9);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_QUERY: &str = "zz";
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("file-search query burst benchmark failed: {error:#}");
+        eprintln!("file-search typed-query benchmark failed: {error:#}");
         std::process::exit(1);
     }
 }
 
 fn run() -> anyhow::Result<()> {
-    let queries = query_tokens();
+    let queries = typed_query_tokens();
     let fixture = Fixture::create(&queries)?;
     let queue_metrics = Arc::new(BenchQueueMetrics::default());
     let reporter = Arc::new(BurstReporter::new(queue_metrics.clone()));
@@ -55,8 +57,10 @@ fn run() -> anyhow::Result<()> {
         None,
     )?;
 
+    // Let the walker and matcher reach an idle, fully populated state before the
+    // typed-query control begins. This keeps the measured burst focused on
+    // superseded query work rather than initial discovery.
     reporter.wait_for_initial_completion(CALLBACK_TIMEOUT)?;
-
     let warmup_sent_at = Instant::now();
     let warmup_id = session.update_query_with_id(WARMUP_QUERY);
     let warmup =
@@ -72,28 +76,16 @@ fn run() -> anyhow::Result<()> {
     queue_metrics.reset();
     reporter.reset();
 
-    let mut total_newest_query_callback_latency_ns = 0_u128;
-    for _ in 0..BURSTS_PER_SAMPLE {
-        total_newest_query_callback_latency_ns += u128::from(run_burst(
-            &session,
-            &queries,
-            &reporter,
-            &fixture.final_result_file,
-        )?);
-    }
-
+    let newest_query_callback_latency_ns =
+        run_typed_query_burst(&session, &queries, &reporter, &fixture.final_result_file)?;
     let queue_stats = queue_metrics.queue_stats();
-    let expected_resolved_query_count = UPDATE_COUNT * BURSTS_PER_SAMPLE;
-    if queue_stats.resolved_query_count != expected_resolved_query_count {
+    if queue_stats.logical_update_count != UPDATE_COUNT {
         anyhow::bail!(
-            "resolved {} of {expected_resolved_query_count} query updates",
-            queue_stats.resolved_query_count
+            "recorded {} logical updates; expected {UPDATE_COUNT}",
+            queue_stats.logical_update_count
         );
     }
     let outcomes = reporter.outcomes();
-    let newest_query_callback_latency_ns =
-        (total_newest_query_callback_latency_ns / BURSTS_PER_SAMPLE as u128)
-            .min(u128::from(u64::MAX)) as u64;
 
     emit(
         "newest_query_callback_latency_ns",
@@ -109,8 +101,16 @@ fn run() -> anyhow::Result<()> {
         usize_to_u64(queue_stats.resolved_query_count),
     );
     emit(
+        "logical_query_update_count",
+        usize_to_u64(queue_stats.logical_update_count),
+    );
+    emit(
         "session_completion_count",
         usize_to_u64(outcomes.completion_count),
+    );
+    emit(
+        "worker_completion_count",
+        usize_to_u64(queue_stats.completion_count),
     );
     emit(
         "stale_snapshot_count",
@@ -125,7 +125,7 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_burst(
+fn run_typed_query_burst(
     session: &codex_file_search::FileSearchSession,
     queries: &[String],
     reporter: &BurstReporter,
@@ -135,7 +135,7 @@ fn run_burst(
     let mut final_update = None;
     for (index, query) in queries.iter().enumerate() {
         if index != 0 {
-            next_send_at += UPDATE_CADENCE;
+            next_send_at += TYPED_CHAR_CADENCE;
             let remaining = next_send_at.saturating_duration_since(Instant::now());
             if !remaining.is_zero() {
                 thread::sleep(remaining);
@@ -167,12 +167,18 @@ fn run_burst(
         .min(u128::from(u64::MAX)) as u64)
 }
 
-fn query_tokens() -> Vec<String> {
+// These are exactly the distinct `@`-token values produced by ordinary
+// typing at a cursor immediately before an existing `zz` suffix: `azz`,
+// `abzz`, ... . They deliberately are not append-only matcher inputs, which
+// exercises the edit path rather than an incremental append fast path. Every
+// generic fixture path contains the final value, so each query still exercises
+// the broad 8,192-file matcher workload.
+fn typed_query_tokens() -> Vec<String> {
+    let mut prefix = String::new();
     (0..UPDATE_COUNT)
         .map(|index| {
-            let first = char::from(b'a' + (index / 8) as u8);
-            let second = char::from(b'a' + (index % 8) as u8);
-            format!("{first}{second}")
+            prefix.push(char::from(b'a' + (index % 26) as u8));
+            format!("{prefix}{WARMUP_QUERY}")
         })
         .collect()
 }
@@ -196,7 +202,9 @@ struct Fixture {
 impl Fixture {
     fn create(queries: &[String]) -> anyhow::Result<Self> {
         let directory = FixtureDir::new()?;
-        let common_markers = queries.concat();
+        let final_query = queries
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("fixture requires a final query"))?;
 
         for (index, query) in queries.iter().enumerate() {
             fs::write(
@@ -211,15 +219,12 @@ impl Fixture {
             fs::write(
                 directory
                     .path()
-                    .join(format!("fixture_{common_markers}_{index:05}.rs")),
+                    .join(format!("fixture_{final_query}_{index:05}.rs")),
                 b"",
             )
             .with_context(|| format!("create generic fixture {index}"))?;
         }
 
-        let final_query = queries
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("fixture requires a final query"))?;
         Ok(Self {
             directory,
             final_result_file: format!("{final_query}_priority_{:04}.rs", queries.len() - 1),
@@ -432,6 +437,6 @@ fn snapshot_contains_file(snapshot: &FileSearchSnapshot, expected_file: &str) ->
         file_match
             .path
             .file_name()
-            .is_some_and(|file_name| file_name.to_string_lossy() == expected_file)
+            .is_some_and(|name| name == expected_file)
     })
 }

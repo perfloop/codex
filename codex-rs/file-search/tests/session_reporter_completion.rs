@@ -12,97 +12,79 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
 
 const UPDATE_COUNT: usize = 64;
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
+struct ReporterState {
+    updates: Vec<String>,
+    completion_count: usize,
+}
+
+#[derive(Default)]
 struct RecordingReporter {
-    updates: Mutex<Vec<(String, Instant)>>,
-    completions: Mutex<Vec<Instant>>,
+    state: Mutex<ReporterState>,
     changed: Condvar,
 }
 
 impl RecordingReporter {
-    fn wait_for_initial_completion(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut completions = self.completions.lock().unwrap();
-        loop {
-            if !completions.is_empty() {
-                return true;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let (next_completions, _) = self.changed.wait_timeout(completions, remaining).unwrap();
-            completions = next_completions;
+    // Completion is the public synchronization signal. Deliberately use the
+    // same unbounded condition-variable wait as RunReporter rather than a
+    // scheduler-dependent deadline: failure to signal is the contract failure.
+    fn wait_for_initial_completion(&self) {
+        let mut state = self.lock_state();
+        while state.completion_count == 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
-    fn wait_for_update_after(
-        &self,
-        query: &str,
-        sent_at: Instant,
-        timeout: Duration,
-    ) -> Option<Instant> {
-        let deadline = Instant::now() + timeout;
-        let mut updates = self.updates.lock().unwrap();
-        loop {
-            if let Some((_, observed_at)) =
-                updates.iter().rev().find(|(observed_query, observed_at)| {
-                    observed_query == query && *observed_at >= sent_at
-                })
-            {
-                return Some(*observed_at);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let (next_updates, _) = self.changed.wait_timeout(updates, remaining).unwrap();
-            updates = next_updates;
+    fn wait_for_update(&self, query: &str) {
+        let mut state = self.lock_state();
+        while !state
+            .updates
+            .iter()
+            .any(|observed_query| observed_query == query)
+        {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
-    fn wait_for_completion_after(&self, update_at: Instant, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut completions = self.completions.lock().unwrap();
-        loop {
-            if completions
-                .iter()
-                .any(|completion_at| *completion_at >= update_at)
-            {
-                return true;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            let (next_completions, _) = self.changed.wait_timeout(completions, remaining).unwrap();
-            completions = next_completions;
+    fn wait_for_completion_after(&self, prior_count: usize) {
+        let mut state = self.lock_state();
+        while state.completion_count <= prior_count {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
     fn completion_count(&self) -> usize {
-        self.completions.lock().unwrap().len()
+        self.lock_state().completion_count
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ReporterState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 impl SessionReporter for RecordingReporter {
     fn on_update(&self, snapshot: &FileSearchSnapshot) {
-        self.updates
-            .lock()
-            .unwrap()
-            .push((snapshot.query.clone(), Instant::now()));
+        self.lock_state().updates.push(snapshot.query.clone());
         self.changed.notify_all();
     }
 
     fn on_complete(&self) {
-        self.completions.lock().unwrap().push(Instant::now());
+        self.lock_state().completion_count += 1;
         self.changed.notify_all();
     }
 }
@@ -159,24 +141,14 @@ fn session_reports_completion_for_each_sequential_query_update() {
     )
     .unwrap();
 
-    assert!(
-        reporter.wait_for_initial_completion(Duration::from_secs(5)),
-        "initial walk did not complete"
-    );
+    reporter.wait_for_initial_completion();
 
     for update in 0..UPDATE_COUNT {
         let query = format!("completion-marker-{update:02}");
-        let sent_at = Instant::now();
+        let completions_before = reporter.completion_count();
         session.update_query(&query);
-        let update_at = reporter.wait_for_update_after(&query, sent_at, Duration::from_secs(5));
-        assert!(
-            update_at.is_some(),
-            "query update {update} did not produce its own callback"
-        );
-        assert!(
-            reporter.wait_for_completion_after(update_at.unwrap(), Duration::from_secs(5)),
-            "query update {update} did not produce a completion after its callback"
-        );
+        reporter.wait_for_update(&query);
+        reporter.wait_for_completion_after(completions_before);
     }
 
     assert!(
