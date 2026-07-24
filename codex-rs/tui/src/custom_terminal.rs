@@ -616,7 +616,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
     let mut to_skip: usize = 0;
     let mut updates = vec![];
     let mut clears = vec![];
-    let mut last_changed_column: Option<usize> = None;
+    let mut changed_blank_suffix = false;
     let width = a.area.width as usize;
     for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
         let current_width = display_width(current.symbol());
@@ -626,10 +626,10 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
         if changed {
             let column = i % width;
             let changed_end = column + affected_width.max(1).saturating_sub(1);
-            last_changed_column = Some(
-                last_changed_column
-                    .map_or(changed_end, |last_changed| last_changed.max(changed_end)),
-            );
+            changed_blank_suffix |= last_nonblank_columns[row]
+                .map_or(true, |last_nonblank_column| {
+                    changed_end > last_nonblank_column
+                });
         }
         if !current.skip && (changed || invalidated > 0) && to_skip == 0 {
             let (x, y) = a.pos_of(i);
@@ -650,10 +650,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
         if i % width == width - 1 {
             let last_nonblank_column = last_nonblank_columns[row];
             let clear_start_column = last_nonblank_column.map_or(0, |column| column + 1);
-            let clear_needed = force_full_clear
-                || last_changed_column.is_some_and(|last_changed| {
-                    last_nonblank_column.map_or(true, |last_nonblank| last_changed > last_nonblank)
-                });
+            let clear_needed = force_full_clear || changed_blank_suffix;
             if clear_start_column < width && clear_needed {
                 let row_start = i + 1 - width;
                 let (x, y) = a.pos_of(row_start + clear_start_column);
@@ -663,7 +660,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
                     bg: current.bg,
                 });
             }
-            last_changed_column = None;
+            changed_blank_suffix = false;
         }
     }
     clears.extend(updates);
