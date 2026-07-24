@@ -244,7 +244,7 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             visible_history_rows: 0,
-            force_full_clear: true,
+            force_full_clear: false,
         }
     }
 
@@ -651,7 +651,11 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
 
         if i % width == width - 1 {
             let last_nonblank_column = last_nonblank_columns[row];
-            let clear_start_column = last_nonblank_column.map_or(0, |column| column + 1);
+            let clear_start_column = if force_full_clear {
+                0
+            } else {
+                last_nonblank_column.map_or(0, |column| column + 1)
+            };
             let clear_needed = force_full_clear || changed_blank_suffix;
             if clear_start_column < width && clear_needed {
                 let row_start = i + 1 - width;
@@ -1068,8 +1072,8 @@ mod tests {
         assert!(
             invalidated_commands
                 .iter()
-                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 3, y: 0, .. })),
-            "invalidated viewport must clear the blank tail; commands: {invalidated_commands:?}",
+                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 0, y: 0, .. })),
+            "invalidated viewport must clear the whole row before repainting; commands: {invalidated_commands:?}",
         );
     }
 
@@ -1228,6 +1232,66 @@ mod tests {
             !screen.contains("old tail"),
             "retry retained stale suffix: {screen:?}",
         );
+    }
+
+    #[test]
+    fn invalidated_viewport_clears_raw_prefix_before_later_text() {
+        let mut terminal = Terminal::with_options_and_cursor_position(
+            BufferedBackend::new(/*width*/ 12, /*height*/ 1),
+            Position::ORIGIN,
+        )
+        .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
+        draw_blank(&mut terminal).expect("initial blank draw");
+
+        terminal
+            .backend_mut()
+            .write_all(b"\x1b[Hstale")
+            .expect("buffer direct stale text");
+        Backend::flush(terminal.backend_mut()).expect("publish direct stale text");
+        terminal.invalidate_viewport();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let buffer = frame.buffer_mut();
+                buffer.set_style(area, Style::default());
+                buffer.set_string(area.x + 6, area.y, "new", Style::default());
+            })
+            .expect("recovery frame");
+
+        let screen = terminal.backend().parser.screen().contents();
+        assert!(
+            screen.contains("      new"),
+            "replacement missing: {screen:?}"
+        );
+        assert!(!screen.contains("stale"), "raw prefix survived: {screen:?}");
+    }
+
+    #[test]
+    fn autoresize_repaints_unchanged_content() {
+        let mut terminal = Terminal::with_options_and_cursor_position(
+            BufferedBackend::new(/*width*/ 12, /*height*/ 1),
+            Position::ORIGIN,
+        )
+        .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 12, 1));
+        draw_text(&mut terminal, "new").expect("initial frame");
+
+        terminal
+            .backend_mut()
+            .write_all(b"\x1b[Hold")
+            .expect("buffer direct stale text");
+        Backend::flush(terminal.backend_mut()).expect("publish direct stale text");
+        terminal.backend_mut().size = Size {
+            width: 12,
+            height: 2,
+        };
+        terminal.autoresize().expect("autoresize");
+        draw_text(&mut terminal, "new").expect("resized frame");
+
+        let screen = terminal.backend().parser.screen().contents();
+        assert!(screen.contains("new"), "replacement missing: {screen:?}");
+        assert!(!screen.contains("old"), "raw content survived: {screen:?}");
     }
 
     #[test]
