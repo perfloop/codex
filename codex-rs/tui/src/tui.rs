@@ -962,16 +962,13 @@ impl Tui {
 
         let terminal = &mut self.terminal;
         let state = &mut self.ambient_pet_image_state;
-        let result = stdout().sync_update(|_| {
+        stdout().sync_update(|_| {
             match crate::pets::render_ambient_pet_image(terminal.backend_mut(), state, request) {
                 Ok(()) => Ok(Ok(())),
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
                 Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
             }
-        });
-        // Image protocols write directly to the terminal, outside the diff buffers.
-        self.terminal.invalidate_viewport();
-        result??
+        })??
     }
 
     pub fn draw_pet_picker_preview_image(
@@ -984,7 +981,7 @@ impl Tui {
 
         let terminal = &mut self.terminal;
         let state = &mut self.pet_picker_preview_image_state;
-        let result = stdout().sync_update(|_| {
+        stdout().sync_update(|_| {
             match crate::pets::render_pet_picker_preview_image(
                 terminal.backend_mut(),
                 state,
@@ -994,10 +991,7 @@ impl Tui {
                 Err(crate::pets::PetImageRenderError::Terminal(err)) => Err(err),
                 Err(err @ crate::pets::PetImageRenderError::Asset(_)) => Ok(Err(err)),
             }
-        });
-        // Image protocols write directly to the terminal, outside the diff buffers.
-        self.terminal.invalidate_viewport();
-        result??
+        })??
     }
 
     pub fn clear_ambient_pet_image(
@@ -1007,14 +1001,11 @@ impl Tui {
             return Err(crate::pets::PetImageRenderError::Terminal(err));
         }
 
-        let result = crate::pets::render_ambient_pet_image(
+        crate::pets::render_ambient_pet_image(
             self.terminal.backend_mut(),
             &mut self.ambient_pet_image_state,
             /*request*/ None,
-        );
-        // Image protocols write directly to the terminal, outside the diff buffers.
-        self.terminal.invalidate_viewport();
-        result
+        )
     }
 
     /// Draw a frame using the resize-reflow viewport and history insertion rules.

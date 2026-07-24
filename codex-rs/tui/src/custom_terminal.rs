@@ -582,7 +582,7 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
         return vec![];
     }
 
-    let mut last_nonblank_columns = vec![0; a.area.height as usize];
+    let mut last_nonblank_columns = vec![None; a.area.height as usize];
     for y in 0..a.area.height {
         let row_start = y as usize * a.area.width as usize;
         let row_end = row_start + a.area.width as usize;
@@ -593,14 +593,15 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
         // any cell whose bg differs from the row’s trailing bg, or any cell with modifiers.
         // Multi-width glyphs extend that region through their full displayed width.
         // After that point the rest of the row can be cleared with a single ClearToEnd, a perf win
-        // versus emitting multiple space Put commands.
-        let mut last_nonblank_column = 0usize;
+        // versus emitting multiple space Put commands. None represents an entirely default row,
+        // whose required clear must start at column zero.
+        let mut last_nonblank_column = None;
         let mut column = 0usize;
         while column < row.len() {
             let cell = &row[column];
             let width = display_width(cell.symbol());
             if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
-                last_nonblank_column = column + (width.saturating_sub(1));
+                last_nonblank_column = Some(column + (width.saturating_sub(1)));
             }
             column += width.max(1); // treat zero-width symbols as width 1
         }
@@ -632,7 +633,9 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
         }
         if !current.skip && (changed || invalidated > 0) && to_skip == 0 {
             let (x, y) = a.pos_of(i);
-            if x as usize <= last_nonblank_columns[row] {
+            if last_nonblank_columns[row]
+                .is_some_and(|last_nonblank_column| x as usize <= last_nonblank_column)
+            {
                 updates.push(DrawCommand::Put {
                     x,
                     y,
@@ -646,13 +649,14 @@ fn diff_buffers(a: &Buffer, b: &Buffer, force_full_clear: bool) -> Vec<DrawComma
 
         if i % width == width - 1 {
             let last_nonblank_column = last_nonblank_columns[row];
-            if last_nonblank_column + 1 < width
-                && (force_full_clear
-                    || last_changed_column
-                        .is_some_and(|last_changed| last_changed > last_nonblank_column))
-            {
+            let clear_start_column = last_nonblank_column.map_or(0, |column| column + 1);
+            let clear_needed = force_full_clear
+                || last_changed_column.is_some_and(|last_changed| {
+                    last_nonblank_column.map_or(true, |last_nonblank| last_changed > last_nonblank)
+                });
+            if clear_start_column < width && clear_needed {
                 let row_start = i + 1 - width;
-                let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
+                let (x, y) = a.pos_of(row_start + clear_start_column);
                 clears.push(DrawCommand::ClearToEnd {
                     x,
                     y,
@@ -795,6 +799,8 @@ impl ModifierDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_backend::VT100Backend;
     use pretty_assertions::assert_eq;
     use ratatui::backend::WindowSize;
     use ratatui::layout::Rect;
@@ -972,30 +978,55 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_viewport_forces_tail_clear_on_next_draw() {
-        let mut terminal =
-            Terminal::with_options(CaptureBackend::new(/*width*/ 8, /*height*/ 1))
-                .expect("terminal");
-        terminal.set_viewport_area(Rect::new(0, 0, 8, 1));
-        terminal
-            .draw(|frame| {
-                frame.buffer_mut().set_string(0, 0, "old", Style::default());
-            })
-            .expect("initial draw");
+    fn invalidated_blank_viewport_clears_column_zero() {
+        for (width, stale) in [(12, "stale"), (1, "X")] {
+            let mut terminal =
+                Terminal::with_options(VT100Backend::new(width, /*height*/ 1)).expect("terminal");
+            terminal.set_viewport_area(Rect::new(0, 0, width, 1));
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame.buffer_mut().set_style(area, Style::default());
+                })
+                .expect("initial blank draw");
 
-        terminal.backend_mut().output.clear();
-        terminal.invalidate_viewport();
-        terminal
-            .draw(|frame| {
-                frame.buffer_mut().set_string(0, 0, "new", Style::default());
-            })
-            .expect("invalidated draw");
+            terminal
+                .backend_mut()
+                .write_all(b"\x1b[H")
+                .expect("write direct cursor move");
+            terminal
+                .backend_mut()
+                .write_all(stale.as_bytes())
+                .expect("write direct stale content");
+            assert!(
+                terminal
+                    .backend()
+                    .vt100()
+                    .screen()
+                    .contents()
+                    .contains(stale),
+                "direct write should seed stale content at column zero",
+            );
 
-        assert!(
-            terminal.backend().output().contains("\x1b[K"),
-            "invalidated draw must clear the trailing cells; output: {:?}",
-            terminal.backend().output(),
-        );
+            terminal.invalidate_viewport();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame.buffer_mut().set_style(area, Style::default());
+                })
+                .expect("invalidated blank draw");
+
+            assert!(
+                !terminal
+                    .backend()
+                    .vt100()
+                    .screen()
+                    .contents()
+                    .contains(stale),
+                "invalidated blank {width}-column viewport retained stale content: {:?}",
+                terminal.backend().vt100().screen().contents(),
+            );
+        }
     }
 
     #[test]
