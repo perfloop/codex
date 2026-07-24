@@ -176,8 +176,8 @@ impl FileSearchSession {
         let enqueued_at = Instant::now();
         if let Some(metrics) = &self.inner.bench_queue_metrics {
             // Coalescing may make logical submissions outnumber physical signals.
-            metrics.record_submitted(update_id, pattern_text);
-            metrics.record_enqueued();
+            metrics.submitted(update_id, pattern_text);
+            metrics.enqueued();
         }
         let delivered = self
             .inner
@@ -188,10 +188,8 @@ impl FileSearchSession {
                 enqueued_at,
             })
             .is_ok();
-        if !delivered {
-            if let Some(metrics) = &self.inner.bench_queue_metrics {
-                metrics.record_send_failed();
-            }
+        if !delivered && let Some(metrics) = &self.inner.bench_queue_metrics {
+            metrics.rejected();
         }
         update_id
     }
@@ -246,10 +244,8 @@ fn create_session_inner(
     options: FileSearchOptions,
     reporter: Arc<dyn SessionReporter>,
     cancel_flag: Option<Arc<AtomicBool>>,
-    bench_queue_metrics: BenchQueueMetricsArg,
+    _bench_queue_metrics: BenchQueueMetricsArg,
 ) -> anyhow::Result<FileSearchSession> {
-    #[cfg(not(feature = "perfloop-bench"))]
-    let _ = bench_queue_metrics;
     let FileSearchOptions {
         limit,
         exclude,
@@ -289,7 +285,7 @@ fn create_session_inner(
         reporter,
         work_tx,
         #[cfg(feature = "perfloop-bench")]
-        bench_queue_metrics,
+        bench_queue_metrics: _bench_queue_metrics,
         #[cfg(feature = "perfloop-bench")]
         next_update_id: AtomicU64::new(0),
     });
@@ -445,120 +441,90 @@ pub struct BenchQueueMetrics {
 #[cfg(feature = "perfloop-bench")]
 #[derive(Default)]
 struct BenchQueueMetricsState {
-    // Physical query signals in the worker queue.
+    // Physical pending query work, separate from logical update calls.
     depth: usize,
-    peak_depth: usize,
-    enqueued_depth_sum: u128,
-    enqueued_depth_count: usize,
-    ages_ns: Vec<u64>,
-    // Logical update_query calls.
-    logical_update_count: usize,
-    latest_update_id: u64,
+    peak: usize,
+    depth_sum: u128,
+    enqueues: usize,
+    ages: Vec<u64>,
+    logical: usize,
+    latest_id: u64,
     latest_query: String,
-    completion_count: usize,
-}
-
-#[cfg(feature = "perfloop-bench")]
-#[derive(Clone, Copy, Debug)]
-#[doc(hidden)]
-pub struct BenchQueueStats {
-    pub peak_depth: usize,
-    pub enqueued_mean_depth_milli: u64,
-    pub p99_age_ns: u64,
-    pub resolved_query_count: usize,
-    pub logical_update_count: usize,
-    pub completion_count: usize,
 }
 
 #[cfg(feature = "perfloop-bench")]
 impl BenchQueueMetrics {
-    #[doc(hidden)]
     pub fn reset(&self) {
-        *self.lock_state() = BenchQueueMetricsState::default();
+        *self.lock() = BenchQueueMetricsState::default();
     }
 
-    #[doc(hidden)]
-    pub fn latest_query_identity(&self) -> (u64, String) {
-        let state = self.lock_state();
-        (state.latest_update_id, state.latest_query.clone())
+    pub fn latest(&self) -> (u64, String) {
+        let state = self.lock();
+        (state.latest_id, state.latest_query.clone())
     }
 
-    #[doc(hidden)]
-    pub fn queue_stats(&self) -> BenchQueueStats {
-        let state = self.lock_state();
-        let mut ages_ns = state.ages_ns.clone();
-        let peak_depth = state.peak_depth;
-        let enqueued_mean_depth_milli = if state.enqueued_depth_count == 0 {
-            0
-        } else {
-            (state.enqueued_depth_sum.saturating_mul(1_000) / state.enqueued_depth_count as u128)
-                .min(u128::from(u64::MAX)) as u64
+    pub fn stats(&self) -> (u64, u64, u64, u64, u64) {
+        let (mut ages, peak, sum, enqueues, logical) = {
+            let state = self.lock();
+            (
+                state.ages.clone(),
+                state.peak,
+                state.depth_sum,
+                state.enqueues,
+                state.logical,
+            )
         };
-        let logical_update_count = state.logical_update_count;
-        let completion_count = state.completion_count;
-        drop(state);
-
-        ages_ns.sort_unstable();
-        let p99_age_ns = ages_ns
+        ages.sort_unstable();
+        let p99 = ages
             .get(
-                ages_ns
-                    .len()
+                ages.len()
                     .saturating_mul(99)
                     .div_ceil(100)
                     .saturating_sub(1),
             )
             .copied()
             .unwrap_or_default();
-        BenchQueueStats {
-            peak_depth,
-            enqueued_mean_depth_milli,
-            p99_age_ns,
-            resolved_query_count: ages_ns.len(),
-            logical_update_count,
-            completion_count,
-        }
+        let mean = if enqueues == 0 {
+            0
+        } else {
+            (sum.saturating_mul(1_000) / enqueues as u128).min(u128::from(u64::MAX)) as u64
+        };
+        (peak as u64, mean, p99, ages.len() as u64, logical as u64)
     }
 
-    #[doc(hidden)]
-    pub fn record_submitted(&self, update_id: u64, query: &str) {
-        let mut state = self.lock_state();
-        state.logical_update_count += 1;
-        state.latest_update_id = update_id;
+    pub fn submitted(&self, update_id: u64, query: &str) {
+        let mut state = self.lock();
+        state.logical += 1;
+        state.latest_id = update_id;
         state.latest_query.clear();
         state.latest_query.push_str(query);
     }
 
-    #[doc(hidden)]
-    pub fn record_enqueued(&self) {
-        let mut state = self.lock_state();
+    pub fn enqueued(&self) {
+        let mut state = self.lock();
         state.depth += 1;
-        state.peak_depth = state.peak_depth.max(state.depth);
-        state.enqueued_depth_sum = state.enqueued_depth_sum.saturating_add(state.depth as u128);
-        state.enqueued_depth_count += 1;
+        state.peak = state.peak.max(state.depth);
+        state.depth_sum = state.depth_sum.saturating_add(state.depth as u128);
+        state.enqueues += 1;
     }
 
-    #[doc(hidden)]
-    pub fn record_resolved(&self, enqueued_at: Instant) {
-        let mut state = self.lock_state();
+    pub fn resolved(&self, enqueued_at: Instant) {
+        let mut state = self.lock();
         state.depth = state.depth.saturating_sub(1);
-        let age_ns = enqueued_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        state.ages_ns.push(age_ns);
+        state
+            .ages
+            .push(enqueued_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
     }
 
-    #[doc(hidden)]
-    pub fn record_completion(&self) {
-        self.lock_state().completion_count += 1;
-    }
-
-    fn record_send_failed(&self) {
-        let mut state = self.lock_state();
+    fn rejected(&self) {
+        let mut state = self.lock();
         state.depth = state.depth.saturating_sub(1);
     }
 
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, BenchQueueMetricsState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BenchQueueMetricsState> {
         self.inner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -744,7 +710,7 @@ fn matcher_worker(
                     } => {
                         #[cfg(feature = "perfloop-bench")]
                         if let Some(metrics) = &inner.bench_queue_metrics {
-                            metrics.record_resolved(enqueued_at);
+                            metrics.resolved(enqueued_at);
                         }
                         let append = query.starts_with(&last_query);
                         nucleo.pattern.reparse(
@@ -832,10 +798,6 @@ fn matcher_worker(
                     inner.reporter.on_update(&snapshot);
                 }
                 if !status.running && walk_complete {
-                    #[cfg(feature = "perfloop-bench")]
-                    if let Some(metrics) = &inner.bench_queue_metrics {
-                        metrics.record_completion();
-                    }
                     inner.reporter.on_complete();
                 }
             }
@@ -850,10 +812,6 @@ fn matcher_worker(
     }
 
     // If we cancelled or otherwise exited the loop, make sure the reporter is notified.
-    #[cfg(feature = "perfloop-bench")]
-    if let Some(metrics) = &inner.bench_queue_metrics {
-        metrics.record_completion();
-    }
     inner.reporter.on_complete();
 
     Ok(())

@@ -7,92 +7,65 @@ use crossterm::event::KeyModifiers;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 
-fn new_composer() -> (ChatComposer, UnboundedReceiver<AppEvent>) {
-    let (tx, rx) = unbounded_channel::<AppEvent>();
-    let sender = AppEventSender::new(tx);
+fn composer() -> (ChatComposer, UnboundedReceiver<AppEvent>) {
+    let (tx, rx) = unbounded_channel();
     (
         ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
+            true,
+            AppEventSender::new(tx),
+            false,
+            "Ask Codex to do anything".into(),
+            false,
         ),
         rx,
     )
 }
 
-// Mirror FileSearchManager's changed, nonempty query filter.
-fn file_search_manager_queries(receiver: &mut UnboundedReceiver<AppEvent>) -> Vec<String> {
+fn file_search_queries(rx: &mut UnboundedReceiver<AppEvent>) -> Vec<String> {
     let mut queries = Vec::new();
-    let mut last_query = None;
-    loop {
-        match receiver.try_recv() {
-            Ok(AppEvent::StartFileSearch(query))
-                if !query.is_empty() && last_query.as_ref() != Some(&query) =>
-            {
-                last_query = Some(query.clone());
-                queries.push(query);
-            }
-            Ok(_) => {}
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return queries,
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::StartFileSearch(query) = event
+            && !query.is_empty()
+            && queries.last() != Some(&query)
+        {
+            queries.push(query);
         }
     }
+    queries
 }
 
 #[test]
 fn file_search_emission_uses_each_non_burst_prefix_and_one_burst_result() {
-    // Delay past PasteBurst's threshold so each changed token is forwarded.
-    let (mut typed_composer, mut typed_events) = new_composer();
+    let (mut typed, mut typed_events) = composer();
     for ch in ['@', 'z', 'z'] {
-        let _ =
-            typed_composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        let _ = typed.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-        assert!(
-            typed_composer.flush_paste_burst_if_due(),
-            "expected the non-burst character {ch:?} to flush"
-        );
+        assert!(typed.flush_paste_burst_if_due());
     }
-    // Cursor-before-suffix edits are non-append matcher inputs.
     for _ in 0..2 {
-        let _ = typed_composer.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let _ = typed.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
     }
     for ch in ['a', 'b', 'c'] {
-        let _ =
-            typed_composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        let _ = typed.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-        assert!(
-            typed_composer.flush_paste_burst_if_due(),
-            "expected the non-burst character {ch:?} to flush"
-        );
+        assert!(typed.flush_paste_burst_if_due());
     }
     assert_eq!(
-        file_search_manager_queries(&mut typed_events),
-        vec!["z", "zz", "azz", "abzz", "abczz"],
-        "each changed non-burst @ token must reach the file-search event path"
+        file_search_queries(&mut typed_events),
+        ["z", "zz", "azz", "abzz", "abczz"]
     );
 
-    // A 1-ms paste-like stream publishes only its final token.
-    let (mut burst_composer, mut burst_events) = new_composer();
-    let mut now = Instant::now();
-    for ch in ['@', 'z', 'a', 'b'] {
-        let _ = burst_composer.handle_input_basic_with_time(
+    let (mut pasted, mut pasted_events) = composer();
+    let now = Instant::now();
+    for (index, ch) in ['@', 'z', 'a', 'b'].into_iter().enumerate() {
+        let _ = pasted.handle_input_basic_with_time(
             KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-            now,
+            now + Duration::from_millis(index as u64),
         );
-        burst_composer.sync_popups();
-        now += Duration::from_millis(1);
+        pasted.sync_popups();
     }
-    assert!(
-        burst_composer.handle_paste_burst_flush(now + Duration::from_secs(1)),
-        "expected the fast stream to flush as one paste"
-    );
-    assert_eq!(
-        file_search_manager_queries(&mut burst_events),
-        vec!["zab"],
-        "a burst paste must publish only its final @ token"
-    );
+    assert!(pasted.handle_paste_burst_flush(now + Duration::from_secs(1)));
+    assert_eq!(file_search_queries(&mut pasted_events), ["zab"]);
 }
