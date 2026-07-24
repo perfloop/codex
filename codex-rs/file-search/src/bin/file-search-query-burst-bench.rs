@@ -21,6 +21,9 @@ use std::time::Instant;
 
 const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
+// Averaging independent identity-checked bursts makes one proof sample stable
+// without hiding an individual burst behind an unobserved batch runner.
+const BURSTS_PER_SAMPLE: usize = 16;
 // PasteBurst treats an 8-ms-or-shorter plain-character interval as a paste. The
 // TUI's own human-input helper sleeps its recommended 8-ms-plus-1-ms delay and
 // flushes after every character, so this is the source-backed non-burst cadence.
@@ -76,12 +79,23 @@ fn run() -> anyhow::Result<()> {
     queue_metrics.reset();
     reporter.reset();
 
-    let newest_query_callback_latency_ns =
-        run_typed_query_burst(&session, &queries, &reporter, &fixture.final_result_file)?;
+    let mut total_newest_query_callback_latency_ns = 0_u128;
+    for _ in 0..BURSTS_PER_SAMPLE {
+        total_newest_query_callback_latency_ns += u128::from(run_typed_query_burst(
+            &session,
+            &queries,
+            &reporter,
+            &fixture.final_result_file,
+        )?);
+    }
+    let newest_query_callback_latency_ns = (total_newest_query_callback_latency_ns
+        / BURSTS_PER_SAMPLE as u128)
+        .min(u128::from(u64::MAX)) as u64;
     let queue_stats = queue_metrics.queue_stats();
-    if queue_stats.logical_update_count != UPDATE_COUNT {
+    let expected_logical_update_count = UPDATE_COUNT * BURSTS_PER_SAMPLE;
+    if queue_stats.logical_update_count != expected_logical_update_count {
         anyhow::bail!(
-            "recorded {} logical updates; expected {UPDATE_COUNT}",
+            "recorded {} logical updates; expected {expected_logical_update_count}",
             queue_stats.logical_update_count
         );
     }
