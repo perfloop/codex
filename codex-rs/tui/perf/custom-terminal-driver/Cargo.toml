@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "perf-custom-terminal-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
+derive_more = { version = "2.1.1", features = ["is_variant"] }
+ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2", features = ["scrolling-regions", "unstable-backend-writer", "unstable-rendered-line-info", "unstable-widget-ref"] }
+unicode-width = "0.2"
+vt100 = "0.16.2"
+
+[patch.crates-io]
+crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
+ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }
