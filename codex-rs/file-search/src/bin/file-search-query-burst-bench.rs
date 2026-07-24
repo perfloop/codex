@@ -21,6 +21,7 @@ use std::time::Instant;
 
 const FILE_COUNT: usize = 8_192;
 const UPDATE_COUNT: usize = 64;
+const BURSTS_PER_SAMPLE: usize = 32;
 const UPDATE_CADENCE: Duration = Duration::from_millis(2);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const WARMUP_QUERY: &str = "zz";
@@ -71,48 +72,28 @@ fn run() -> anyhow::Result<()> {
     queue_metrics.reset();
     reporter.reset();
 
-    let mut next_send_at = Instant::now();
-    let mut final_update = None;
-    for (index, query) in queries.iter().enumerate() {
-        if index != 0 {
-            next_send_at += UPDATE_CADENCE;
-            let remaining = next_send_at.saturating_duration_since(Instant::now());
-            if !remaining.is_zero() {
-                thread::sleep(remaining);
-            }
-        }
-
-        let sent_at = Instant::now();
-        let update_id = session.update_query_with_id(query);
-        if index + 1 == queries.len() {
-            final_update = Some((update_id, query.as_str(), sent_at));
-        }
+    let mut total_newest_query_callback_latency_ns = 0_u128;
+    for _ in 0..BURSTS_PER_SAMPLE {
+        total_newest_query_callback_latency_ns += u128::from(run_burst(
+            &session,
+            &queries,
+            &reporter,
+            &fixture.final_result_file,
+        )?);
     }
 
-    let (final_update_id, final_query, final_sent_at) =
-        final_update.ok_or_else(|| anyhow::anyhow!("burst had no final query"))?;
-    let final_callback = reporter.wait_for_final_update(
-        final_update_id,
-        final_query,
-        final_sent_at,
-        &fixture.final_result_file,
-        CALLBACK_TIMEOUT,
-    )?;
-    reporter.wait_for_completion_after(final_callback.observed_at, CALLBACK_TIMEOUT)?;
-
     let queue_stats = queue_metrics.queue_stats();
-    if queue_stats.resolved_query_count != UPDATE_COUNT {
+    let expected_resolved_query_count = UPDATE_COUNT * BURSTS_PER_SAMPLE;
+    if queue_stats.resolved_query_count != expected_resolved_query_count {
         anyhow::bail!(
-            "resolved {} of {UPDATE_COUNT} query updates",
+            "resolved {} of {expected_resolved_query_count} query updates",
             queue_stats.resolved_query_count
         );
     }
     let outcomes = reporter.outcomes();
-    let newest_query_callback_latency_ns = final_callback
-        .observed_at
-        .saturating_duration_since(final_sent_at)
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64;
+    let newest_query_callback_latency_ns = (total_newest_query_callback_latency_ns
+        / u128::from(BURSTS_PER_SAMPLE))
+    .min(u128::from(u64::MAX)) as u64;
 
     emit(
         "newest_query_callback_latency_ns",
@@ -142,6 +123,48 @@ fn run() -> anyhow::Result<()> {
     emit("final_callback_verified", 1);
 
     Ok(())
+}
+
+fn run_burst(
+    session: &codex_file_search::FileSearchSession,
+    queries: &[String],
+    reporter: &BurstReporter,
+    expected_file: &str,
+) -> anyhow::Result<u64> {
+    let mut next_send_at = Instant::now();
+    let mut final_update = None;
+    for (index, query) in queries.iter().enumerate() {
+        if index != 0 {
+            next_send_at += UPDATE_CADENCE;
+            let remaining = next_send_at.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining);
+            }
+        }
+
+        let sent_at = Instant::now();
+        let update_id = session.update_query_with_id(query);
+        if index + 1 == queries.len() {
+            final_update = Some((update_id, query.as_str(), sent_at));
+        }
+    }
+
+    let (final_update_id, final_query, final_sent_at) =
+        final_update.ok_or_else(|| anyhow::anyhow!("burst had no final query"))?;
+    let final_callback = reporter.wait_for_final_update(
+        final_update_id,
+        final_query,
+        final_sent_at,
+        expected_file,
+        CALLBACK_TIMEOUT,
+    )?;
+    reporter.wait_for_completion_after(final_callback.observed_at, CALLBACK_TIMEOUT)?;
+
+    Ok(final_callback
+        .observed_at
+        .saturating_duration_since(final_sent_at)
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64)
 }
 
 fn query_tokens() -> Vec<String> {
