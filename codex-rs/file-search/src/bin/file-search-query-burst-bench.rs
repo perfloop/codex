@@ -91,9 +91,9 @@ fn run() -> anyhow::Result<()> {
         );
     }
     let outcomes = reporter.outcomes();
-    let newest_query_callback_latency_ns = (total_newest_query_callback_latency_ns
-        / u128::from(BURSTS_PER_SAMPLE))
-    .min(u128::from(u64::MAX)) as u64;
+    let newest_query_callback_latency_ns =
+        (total_newest_query_callback_latency_ns / BURSTS_PER_SAMPLE as u128)
+            .min(u128::from(u64::MAX)) as u64;
 
     emit(
         "newest_query_callback_latency_ns",
