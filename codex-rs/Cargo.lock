@@ -3080,6 +3080,7 @@ dependencies = [
  "crossbeam-channel",
  "divan",
  "ignore",
+ "libc",
  "nucleo",
  "pretty_assertions",
  "serde",
