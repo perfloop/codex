@@ -77,6 +77,12 @@ struct StreamCore {
     width: Option<usize>,
     /// Incremental render of committed source at `width`.
     render: StreamingRender,
+    /// Committed source bytes already reflected in `render`.
+    rendered_source_len: usize,
+    /// Newly committed source waits for the next presentation tick.
+    render_dirty: bool,
+    /// A presentation tick is pending, so new source can coalesce until it runs.
+    presentation_active: bool,
     /// Lines enqueued into the commit-animation queue.
     enqueued_stable_len: usize,
     /// Lines actually emitted to scrollback.
@@ -114,6 +120,9 @@ impl StreamCore {
             state: StreamState::new(width, cwd),
             width,
             render: StreamingRender::new(),
+            rendered_source_len: 0,
+            render_dirty: false,
+            presentation_active: false,
             enqueued_stable_len: 0,
             emitted_stable_len: 0,
             cwd: cwd.to_path_buf(),
@@ -124,37 +133,74 @@ impl StreamCore {
         }
     }
 
-    /// Push a streaming delta and enqueue any newly-stable rendered lines.
+    /// Push a streaming delta and request a commit tick when new source needs presentation.
     ///
     /// Only newline-terminated source is committed for rendering. This is
     /// important for tables because an unterminated partial row must stay out
     /// of both the stable queue and the live tail until its structure is
     /// unambiguous; otherwise the user can briefly see malformed columns that
-    /// immediately disappear on the next delta.
+    /// immediately disappear on the next delta. Source renders immediately
+    /// at the start of a presentation burst; later commits coalesce until its next tick.
     fn push_delta(&mut self, delta: &str) -> bool {
         if !delta.is_empty() {
             self.state.has_seen_delta = true;
         }
         self.state.collector.push_delta(delta);
 
-        let mut enqueued = false;
         if delta.contains('\n')
             && let Some(range) = self.state.collector.commit_complete_source()
         {
             let source = self.state.collector.committed_source();
             let committed_source = &source[range];
             self.holdback_scanner.push_source_chunk(committed_source);
-            self.render.append(
-                source,
-                committed_source,
-                self.width,
-                self.cwd.as_path(),
-                self.render_mode,
-                self.inline_visualization_context.as_ref(),
-            );
-            enqueued = self.sync_stable_queue();
+
+            if self.presentation_active {
+                self.render_dirty = true;
+            } else {
+                self.render.append(
+                    source,
+                    committed_source,
+                    self.width,
+                    self.cwd.as_path(),
+                    self.render_mode,
+                    self.inline_visualization_context.as_ref(),
+                );
+                self.rendered_source_len = source.len();
+                self.render_dirty = false;
+                self.sync_stable_queue();
+            }
+            self.presentation_active = true;
+            return true;
         }
-        enqueued
+        false
+    }
+
+    /// Render all committed source accepted since the previous presentation boundary.
+    fn flush_pending_render(&mut self) {
+        if !self.render_dirty {
+            return;
+        }
+
+        let source = self.state.collector.committed_source();
+        let source_len = source.len();
+        let rendered_source_len = self.rendered_source_len.min(source_len);
+        let committed_source = &source[rendered_source_len..];
+        if committed_source.is_empty() {
+            self.render_dirty = false;
+            return;
+        }
+
+        self.render.append(
+            source,
+            committed_source,
+            self.width,
+            self.cwd.as_path(),
+            self.render_mode,
+            self.inline_visualization_context.as_ref(),
+        );
+        self.rendered_source_len = source_len;
+        self.render_dirty = false;
+        self.sync_stable_queue();
     }
 
     /// Drain the collector, render the final source snapshot, and return lines not yet emitted.
@@ -177,23 +223,26 @@ impl StreamCore {
         (remaining, source)
     }
 
-    /// Step animation: dequeue one line, update the emitted count.
+    /// Step animation: render the pending source snapshot, then dequeue one line.
     fn tick(&mut self) -> Vec<HyperlinkLine> {
+        let had_pending_render = self.render_dirty;
+        self.flush_pending_render();
         let step = self.state.step();
         self.emitted_stable_len += step.len();
+        self.presentation_active = had_pending_render || !self.state.is_idle();
         step
     }
 
-    /// Batch drain: dequeue up to `max_lines`, update the emitted count.
+    /// Batch drain: render the pending source snapshot, then dequeue up to `max_lines`.
     fn tick_batch(&mut self, max_lines: usize) -> Vec<HyperlinkLine> {
         if max_lines == 0 {
             return Vec::new();
         }
+        let had_pending_render = self.render_dirty;
+        self.flush_pending_render();
         let step = self.state.drain_n(max_lines);
-        if step.is_empty() {
-            return step;
-        }
         self.emitted_stable_len += step.len();
+        self.presentation_active = had_pending_render || !self.state.is_idle();
         step
     }
 
@@ -202,7 +251,7 @@ impl StreamCore {
 
     #[inline]
     fn is_idle(&self) -> bool {
-        self.state.is_idle()
+        !self.render_dirty && !self.presentation_active && self.state.is_idle()
     }
 
     #[inline]
@@ -246,6 +295,7 @@ impl StreamCore {
         if self.width == width {
             return;
         }
+        self.flush_pending_render();
         let had_pending_queue = self.state.queued_len() > 0;
         let had_live_tail = self.has_tail();
         self.width = width;
@@ -254,6 +304,7 @@ impl StreamCore {
         if source.is_empty() {
             return;
         }
+        let source_len = source.len();
 
         self.render.recompute(
             source,
@@ -262,6 +313,8 @@ impl StreamCore {
             self.render_mode,
             self.inline_visualization_context.as_ref(),
         );
+        self.rendered_source_len = source_len;
+        self.render_dirty = false;
         self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
         if had_pending_queue
             && self.emitted_stable_len == self.render.lines.len()
@@ -287,6 +340,9 @@ impl StreamCore {
     fn reset(&mut self) {
         self.state.clear();
         self.render.clear();
+        self.rendered_source_len = 0;
+        self.render_dirty = false;
+        self.presentation_active = false;
         self.enqueued_stable_len = 0;
         self.emitted_stable_len = 0;
         self.stable_prefix_len_cache = None;
@@ -298,6 +354,7 @@ impl StreamCore {
             return;
         }
 
+        self.flush_pending_render();
         let had_pending_queue = self.state.queued_len() > 0;
         let had_live_tail = self.has_tail();
         self.render_mode = render_mode;
@@ -305,6 +362,7 @@ impl StreamCore {
         if source.is_empty() {
             return;
         }
+        let source_len = source.len();
 
         self.render.recompute(
             source,
@@ -313,6 +371,8 @@ impl StreamCore {
             self.render_mode,
             self.inline_visualization_context.as_ref(),
         );
+        self.rendered_source_len = source_len;
+        self.render_dirty = false;
         self.emitted_stable_len = self.emitted_stable_len.min(self.render.lines.len());
         if had_pending_queue
             && self.emitted_stable_len == self.render.lines.len()
@@ -339,8 +399,8 @@ impl StreamCore {
     }
 
     /// Advance `enqueued_stable_len` toward the target stable boundary and enqueue any
-    /// newly-stable lines. Returns `true` if new lines were enqueued.
-    fn sync_stable_queue(&mut self) -> bool {
+    /// newly-stable lines.
+    fn sync_stable_queue(&mut self) {
         let target_stable_len = self.compute_target_stable_len();
 
         // A structural rewrite moved the stable boundary backward into enqueue-but-unemitted
@@ -353,17 +413,16 @@ impl StreamCore {
                 );
             }
             self.enqueued_stable_len = target_stable_len;
-            return self.state.queued_len() > 0;
+            return;
         }
 
         if target_stable_len == self.enqueued_stable_len {
-            return false;
+            return;
         }
 
         self.state
             .enqueue(self.render.lines[self.enqueued_stable_len..target_stable_len].to_vec());
         self.enqueued_stable_len = target_stable_len;
-        true
     }
 
     /// Rebuild the stable queue from the current render snapshot.
@@ -505,6 +564,7 @@ impl StreamController {
         }
     }
 
+    /// Add a delta and report whether commit animation should be running.
     pub(crate) fn push(&mut self, delta: &str) -> bool {
         self.core.push_delta(delta)
     }
@@ -622,6 +682,7 @@ impl PlanStreamController {
         }
     }
 
+    /// Add a delta and report whether commit animation should be running.
     pub(crate) fn push(&mut self, delta: &str) -> bool {
         self.core.push_delta(delta)
     }
@@ -916,6 +977,43 @@ mod tests {
     }
 
     #[test]
+    fn controller_coalesces_table_updates_until_a_quiet_presentation_tick() {
+        let mut ctrl = stream_controller(Some(80));
+        let header = "| Key | Value |\n";
+        let delimiter = "| --- | --- |\n";
+        let row = "| later | value |\n";
+        let confirmed_table = format!("{header}{delimiter}");
+        let full_source = format!("{confirmed_table}{row}");
+
+        assert!(ctrl.push(header));
+        assert_eq!(ctrl.core.rendered_source_len, header.len());
+
+        assert!(ctrl.push(delimiter));
+        assert!(ctrl.core.render_dirty);
+        assert_eq!(ctrl.core.rendered_source_len, header.len());
+
+        let (_cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(
+            !idle,
+            "a coalesced update must keep one quiet tick scheduled before stopping animation"
+        );
+        assert!(!ctrl.core.render_dirty);
+        assert!(ctrl.core.presentation_active);
+        assert_eq!(ctrl.core.rendered_source_len, confirmed_table.len());
+
+        let (_cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle, "a quiet tick should end the presentation burst");
+        assert!(!ctrl.core.presentation_active);
+
+        assert!(ctrl.push(row));
+        assert!(
+            !ctrl.core.render_dirty,
+            "the first update after an idle stop must render immediately"
+        );
+        assert_eq!(ctrl.core.rendered_source_len, full_source.len());
+    }
+
+    #[test]
     fn controller_has_live_tail_reflects_tail_presence() {
         let mut ctrl = stream_controller(Some(80));
         assert!(!ctrl.has_live_tail());
@@ -1082,6 +1180,8 @@ mod tests {
         assert_eq!(ctrl.queued_lines(), 0, "expected empty queue before table");
 
         ctrl.push("| A | B |\n");
+        let (_cell, idle) = ctrl.on_commit_tick();
+        assert!(idle, "table header should have no stable lines to drain");
         assert_eq!(
             ctrl.queued_lines(),
             0,
@@ -1132,7 +1232,9 @@ mod tests {
         let (_cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
         assert!(idle, "intro line should fully drain");
 
-        assert!(!ctrl.push("| Step | Owner |\n"));
+        assert!(ctrl.push("| Step | Owner |\n"));
+        let (_cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+        assert!(idle, "table header should have no stable lines to drain");
         assert!(
             ctrl.has_live_tail(),
             "expected plan table header to be held"
@@ -1321,7 +1423,12 @@ mod tests {
                 .any(|line| line.contains("Intro line before table.")),
             "expected pre-table line to commit independently: {committed:?}",
         );
-        assert!(idle, "only pre-table content should have been queued");
+        assert!(
+            !idle,
+            "coalescing the table confirmation should keep one quiet tick scheduled"
+        );
+        let (_cell, idle) = ctrl.on_commit_tick();
+        assert!(idle, "the quiet tick should leave only the table tail");
     }
 
     #[test]
