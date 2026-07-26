@@ -14,13 +14,7 @@ use nucleo::Utf32String;
 use nucleo::pattern::CaseMatching;
 use nucleo::pattern::Normalization;
 use serde::Serialize;
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::ffi::CString;
 use std::num::NonZero;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +22,6 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -196,7 +189,6 @@ pub fn create_session(
 
     let cancelled = cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
-    let match_type_tracker = Arc::new(MatchTypeTracker::new());
     let inner = Arc::new(SessionInner {
         search_directories,
         limit: limit.get(),
@@ -206,7 +198,6 @@ pub fn create_session(
         cancelled,
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
-        match_type_tracker,
         work_tx,
     });
 
@@ -351,196 +342,6 @@ fn create_pattern(pattern: &str) -> Pattern {
     )
 }
 
-const UNKNOWN_MATCH_TYPE: u8 = 0;
-const FILE_MATCH_TYPE: u8 = 1;
-const DIRECTORY_MATCH_TYPE: u8 = 2;
-
-struct SearchItem {
-    full_path: Arc<str>,
-    cached_match_type: AtomicU8,
-    // The walk-time type is not usable until a snapshot has classified this
-    // item after its parent directory became watched.
-    cache_is_current: AtomicBool,
-    cacheable_match_type: bool,
-}
-
-impl SearchItem {
-    fn new(full_path: Arc<str>, match_type: Option<MatchType>, cacheable_match_type: bool) -> Self {
-        Self {
-            full_path,
-            cached_match_type: AtomicU8::new(
-                match_type.map_or(UNKNOWN_MATCH_TYPE, encode_match_type),
-            ),
-            cache_is_current: AtomicBool::new(false),
-            cacheable_match_type,
-        }
-    }
-
-    fn cached_match_type(&self) -> Option<MatchType> {
-        (self.cacheable_match_type && self.cache_is_current.load(Ordering::Relaxed))
-            .then(|| decode_match_type(self.cached_match_type.load(Ordering::Relaxed)))
-            .flatten()
-    }
-
-    fn update_cached_match_type(&self, match_type: MatchType) {
-        if self.cacheable_match_type {
-            self.cached_match_type
-                .store(encode_match_type(match_type), Ordering::Relaxed);
-            self.cache_is_current.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-fn encode_match_type(match_type: MatchType) -> u8 {
-    match match_type {
-        MatchType::File => FILE_MATCH_TYPE,
-        MatchType::Directory => DIRECTORY_MATCH_TYPE,
-    }
-}
-
-fn decode_match_type(encoded: u8) -> Option<MatchType> {
-    match encoded {
-        FILE_MATCH_TYPE => Some(MatchType::File),
-        DIRECTORY_MATCH_TYPE => Some(MatchType::Directory),
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "linux")]
-const MAX_MATCH_TYPE_WATCHES: usize = 1024;
-
-#[cfg(target_os = "linux")]
-struct MatchTypeTracker {
-    fd: libc::c_int,
-    watched_directories: Mutex<HashSet<PathBuf>>,
-    dirty: AtomicBool,
-}
-
-#[cfg(target_os = "linux")]
-impl MatchTypeTracker {
-    fn new() -> Self {
-        // SAFETY: inotify_init1 has no pointer arguments and returns an owned file descriptor.
-        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        Self {
-            fd,
-            watched_directories: Mutex::new(HashSet::new()),
-            dirty: AtomicBool::new(fd < 0),
-        }
-    }
-
-    fn watch_ancestors(&self, path: &Path) {
-        // A retained search root can be replaced by renaming any lexical
-        // ancestor, so stop only at the filesystem root.
-        let mut directory = path.parent();
-        while let Some(current) = directory {
-            self.watch_directory(current);
-            if self.dirty.load(Ordering::Relaxed) {
-                return;
-            }
-            directory = current.parent();
-        }
-    }
-
-    fn watch_directory(&self, directory: &Path) {
-        if self.dirty.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let directory_path = directory.to_path_buf();
-        let mut watched_directories = self
-            .watched_directories
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if watched_directories.contains(&directory_path) {
-            return;
-        }
-        if watched_directories.len() >= MAX_MATCH_TYPE_WATCHES {
-            // Preserve fresh classifications rather than consuming unbounded
-            // per-session inotify resources.
-            self.dirty.store(true, Ordering::Relaxed);
-            return;
-        }
-        let Ok(directory) = CString::new(directory_path.as_os_str().as_bytes()) else {
-            self.dirty.store(true, Ordering::Relaxed);
-            return;
-        };
-        let mask = libc::IN_ATTRIB
-            | libc::IN_CREATE
-            | libc::IN_DELETE
-            | libc::IN_DELETE_SELF
-            | libc::IN_MOVE_SELF
-            | libc::IN_MOVED_FROM
-            | libc::IN_MOVED_TO;
-        // SAFETY: fd is owned by this tracker, and directory is a NUL-terminated path string.
-        let watch = unsafe { libc::inotify_add_watch(self.fd, directory.as_ptr(), mask) };
-        if watch < 0 {
-            self.dirty.store(true, Ordering::Relaxed);
-            return;
-        }
-        watched_directories.insert(directory_path);
-    }
-
-    fn can_use_cached_match_types(&self) -> bool {
-        if self.dirty.load(Ordering::Relaxed) {
-            return false;
-        }
-        let _watched_directories = self
-            .watched_directories
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut buffer = [0_u8; 4096];
-        loop {
-            // SAFETY: fd is a live nonblocking inotify descriptor and buffer is writable.
-            let read = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-            if read > 0 {
-                self.dirty.store(true, Ordering::Relaxed);
-                return false;
-            }
-            if read == 0 {
-                self.dirty.store(true, Ordering::Relaxed);
-                return false;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return true;
-            }
-            self.dirty.store(true, Ordering::Relaxed);
-            return false;
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for MatchTypeTracker {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            // SAFETY: fd is owned by this tracker and is closed exactly once on drop.
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-struct MatchTypeTracker;
-
-#[cfg(not(target_os = "linux"))]
-impl MatchTypeTracker {
-    fn new() -> Self {
-        Self
-    }
-
-    fn watch_ancestors(&self, _path: &Path) {}
-
-    fn can_use_cached_match_types(&self) -> bool {
-        false
-    }
-}
-
 struct SessionInner {
     search_directories: Vec<PathBuf>,
     limit: usize,
@@ -550,7 +351,6 @@ struct SessionInner {
     cancelled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
-    match_type_tracker: Arc<MatchTypeTracker>,
     work_tx: Sender<WorkSignal>,
 }
 
@@ -596,6 +396,40 @@ fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(
     rel_path.to_str().map(|p| (root_idx, p))
 }
 
+fn classify_match_types(paths: &[Arc<str>], threads: usize) -> Vec<MatchType> {
+    let mut match_types = vec![MatchType::File; paths.len()];
+    let worker_count = threads.min(paths.len());
+    if worker_count <= 1 {
+        for (path, match_type) in paths.iter().zip(&mut match_types) {
+            *match_type = if Path::new(path.as_ref()).is_dir() {
+                MatchType::Directory
+            } else {
+                MatchType::File
+            };
+        }
+        return match_types;
+    }
+
+    let chunk_size = paths.len().div_ceil(worker_count);
+    thread::scope(|scope| {
+        for (path_chunk, match_type_chunk) in paths
+            .chunks(chunk_size)
+            .zip(match_types.chunks_mut(chunk_size))
+        {
+            scope.spawn(move || {
+                for (path, match_type) in path_chunk.iter().zip(match_type_chunk) {
+                    *match_type = if Path::new(path.as_ref()).is_dir() {
+                        MatchType::Directory
+                    } else {
+                        MatchType::File
+                    };
+                }
+            });
+        }
+    });
+    match_types
+}
+
 /// Walks the search directories and feeds discovered paths into `nucleo`
 /// via the injector.
 ///
@@ -611,7 +445,7 @@ fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(
 fn walker_worker(
     inner: Arc<SessionInner>,
     override_matcher: Option<ignore::overrides::Override>,
-    injector: Injector<SearchItem>,
+    injector: Injector<Arc<str>>,
 ) {
     let Some(first_root) = inner.search_directories.first() else {
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
@@ -662,28 +496,10 @@ fn walker_worker(
             let Some(full_path) = path.to_str() else {
                 return ignore::WalkState::Continue;
             };
-            let is_symlink = entry.path_is_symlink();
-            let match_type = if is_symlink {
-                // `file_type` reports the link itself, while the existing
-                // `Path::is_dir` behavior follows it. Keep symlink
-                // classification deferred to preserve that behavior.
-                None
-            } else {
-                entry.file_type().map(|file_type| {
-                    if file_type.is_dir() {
-                        MatchType::Directory
-                    } else {
-                        MatchType::File
-                    }
-                })
-            };
             if let Some((_, relative_path)) = get_file_path(path, &search_directories) {
-                injector.push(
-                    SearchItem::new(Arc::from(full_path), match_type, !is_symlink),
-                    |_, cols| {
-                        cols[0] = Utf32String::from(relative_path);
-                    },
-                );
+                injector.push(Arc::from(full_path), |_, cols| {
+                    cols[0] = Utf32String::from(relative_path);
+                });
             }
             n += 1;
             if n >= CHECK_INTERVAL {
@@ -701,7 +517,7 @@ fn walker_worker(
 fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
-    mut nucleo: Nucleo<SearchItem>,
+    mut nucleo: Nucleo<Arc<str>>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
     let config = Config::DEFAULT.match_paths();
@@ -758,56 +574,43 @@ fn matcher_worker(
                 if status.changed {
                     let snapshot = nucleo.snapshot();
                     let limit = inner.limit.min(snapshot.matched_item_count() as usize);
+                    let pattern = snapshot.pattern().column_pattern(0);
+                    let mut match_paths = Vec::with_capacity(limit);
+                    let mut match_details = Vec::with_capacity(limit);
                     for match_ in snapshot.matches().iter().take(limit) {
                         let Some(item) = snapshot.get_item(match_.idx) else {
                             continue;
                         };
-                        if item.data.cacheable_match_type {
-                            let path = Path::new(item.data.full_path.as_ref());
-                            inner.match_type_tracker.watch_ancestors(path);
-                        }
+                        let full_path = item.data.clone();
+                        let Some((root_idx, relative_path)) =
+                            get_file_path(Path::new(full_path.as_ref()), &inner.search_directories)
+                        else {
+                            continue;
+                        };
+                        let indices = if let Some(indices_matcher) = indices_matcher.as_mut() {
+                            let mut idx_vec = Vec::<u32>::new();
+                            let haystack = item.matcher_columns[0].slice(..);
+                            let _ = pattern.indices(haystack, indices_matcher, &mut idx_vec);
+                            idx_vec.sort_unstable();
+                            idx_vec.dedup();
+                            Some(idx_vec)
+                        } else {
+                            None
+                        };
+                        let relative_path = PathBuf::from(relative_path);
+                        match_paths.push(full_path);
+                        match_details.push((match_.score, relative_path, root_idx, indices));
                     }
-                    let use_cached_match_types = inner.match_type_tracker.can_use_cached_match_types();
-                    let pattern = snapshot.pattern().column_pattern(0);
-                    let matches: Vec<_> = snapshot
-                        .matches()
-                        .iter()
-                        .take(limit)
-                        .filter_map(|match_| {
-                            let item = snapshot.get_item(match_.idx)?;
-                            let full_path = item.data.full_path.as_ref();
-                            let (root_idx, relative_path) = get_file_path(Path::new(full_path), &inner.search_directories)?;
-                            let indices = if let Some(indices_matcher) = indices_matcher.as_mut() {
-                                let mut idx_vec = Vec::<u32>::new();
-                                let haystack = item.matcher_columns[0].slice(..);
-                                let _ = pattern.indices(haystack, indices_matcher, &mut idx_vec);
-                                idx_vec.sort_unstable();
-                                idx_vec.dedup();
-                                Some(idx_vec)
-                            } else {
-                                None
-                            };
-                            let match_type = if use_cached_match_types {
-                                item.data.cached_match_type()
-                            } else {
-                                None
-                            }
-                            .unwrap_or_else(|| {
-                                let match_type = if Path::new(full_path).is_dir() {
-                                    MatchType::Directory
-                                } else {
-                                    MatchType::File
-                                };
-                                item.data.update_cached_match_type(match_type);
-                                match_type
-                            });
-                            Some(FileMatch {
-                                score: match_.score,
-                                path: PathBuf::from(relative_path),
-                                match_type,
-                                root: inner.search_directories[root_idx].clone(),
-                                indices,
-                            })
+                    let match_types = classify_match_types(&match_paths, inner.threads);
+                    let matches: Vec<_> = match_details
+                        .into_iter()
+                        .zip(match_types)
+                        .map(|((score, path, root_idx, indices), match_type)| FileMatch {
+                            score,
+                            path,
+                            match_type,
+                            root: inner.search_directories[root_idx].clone(),
+                            indices,
                         })
                         .collect();
 
@@ -1104,160 +907,6 @@ mod tests {
                 .iter()
                 .any(|file_match| file_match.path.to_string_lossy().contains("beta.txt"))
         );
-    }
-
-    #[test]
-    fn session_emits_updates_when_query_changes_and_refreshes_match_type_after_entry_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let entry = dir.path().join("matched-entry");
-        fs::write(&entry, "fixture").unwrap();
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            /*cancel_flag*/ None,
-        )
-        .expect("session");
-
-        session.update_query("matched");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        reporter.clear();
-
-        fs::remove_file(&entry).unwrap();
-        fs::create_dir(&entry).unwrap();
-        session.update_query("match");
-        assert!(reporter.wait_until(
-            &reporter.updates,
-            &reporter.update_cv,
-            Duration::from_secs(5),
-            |updates| updates.iter().any(|snapshot| snapshot.query == "match"),
-        ));
-
-        let update = reporter
-            .updates()
-            .into_iter()
-            .rev()
-            .find(|snapshot| snapshot.query == "match")
-            .expect("replacement update");
-        let match_type = update
-            .matches
-            .iter()
-            .find(|file_match| file_match.path == Path::new("matched-entry"))
-            .map(|file_match| file_match.match_type);
-        assert_eq!(match_type, Some(MatchType::Directory));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn session_emits_updates_when_query_changes_and_reclassifies_unwatched_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let watched_parent = dir.path().join("watched-parent");
-        let unwatched_parent = dir.path().join("unwatched-parent");
-        fs::create_dir(&watched_parent).unwrap();
-        fs::create_dir(&unwatched_parent).unwrap();
-        fs::write(watched_parent.join("first-entry"), "fixture").unwrap();
-        let changed = unwatched_parent.join("changed-entry");
-        fs::write(&changed, "fixture").unwrap();
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            /*cancel_flag*/ None,
-        )
-        .expect("session");
-
-        session.update_query("first");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        assert!(reporter.updates().iter().any(|snapshot| {
-            snapshot.query == "first"
-                && snapshot
-                    .matches
-                    .iter()
-                    .any(|file_match| file_match.path == Path::new("watched-parent/first-entry"))
-        }));
-        reporter.clear();
-
-        // The first query does not watch `unwatched_parent`, so this
-        // replacement is not reported by its existing directory watches.
-        fs::remove_file(&changed).unwrap();
-        fs::create_dir(&changed).unwrap();
-        session.update_query("changed");
-        assert!(reporter.wait_until(
-            &reporter.updates,
-            &reporter.update_cv,
-            Duration::from_secs(5),
-            |updates| updates.iter().any(|snapshot| snapshot.query == "changed"),
-        ));
-
-        let update = reporter
-            .updates()
-            .into_iter()
-            .rev()
-            .find(|snapshot| snapshot.query == "changed")
-            .expect("changed-entry update");
-        let match_type = update
-            .matches
-            .iter()
-            .find(|file_match| file_match.path == Path::new("unwatched-parent/changed-entry"))
-            .map(|file_match| file_match.match_type);
-        assert_eq!(match_type, Some(MatchType::Directory));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn session_emits_updates_when_query_changes_and_reclassifies_entries_after_root_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        let root = base.join("root");
-        let entry = root.join("entry");
-        fs::create_dir_all(&entry).unwrap();
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![root.clone()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            /*cancel_flag*/ None,
-        )
-        .expect("session");
-
-        session.update_query("entry");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        assert!(reporter.updates().iter().any(|snapshot| {
-            snapshot.query == "entry"
-                && snapshot.matches.iter().any(|file_match| {
-                    file_match.path == Path::new("entry")
-                        && file_match.match_type == MatchType::Directory
-                })
-        }));
-        reporter.clear();
-
-        // This changes the root's path identity through an ancestor that is
-        // outside the root itself.
-        fs::rename(&base, dir.path().join("base-old")).unwrap();
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&entry, "fixture").unwrap();
-        session.update_query("entr");
-        assert!(reporter.wait_until(
-            &reporter.updates,
-            &reporter.update_cv,
-            Duration::from_secs(5),
-            |updates| updates.iter().any(|snapshot| snapshot.query == "entr"),
-        ));
-
-        let update = reporter
-            .updates()
-            .into_iter()
-            .rev()
-            .find(|snapshot| snapshot.query == "entr")
-            .expect("replacement-root update");
-        let match_type = update
-            .matches
-            .iter()
-            .find(|file_match| file_match.path == Path::new("entry"))
-            .map(|file_match| file_match.match_type);
-        assert_eq!(match_type, Some(MatchType::File));
     }
 
     #[test]
