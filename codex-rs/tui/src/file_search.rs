@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 
-pub(crate) struct FileSearchManager {
+pub struct FileSearchManager {
     state: Arc<Mutex<SearchState>>,
     search_dir: PathBuf,
     app_tx: AppEventSender,
